@@ -25,11 +25,10 @@ class UserTowerRetrievalPyfunc(PythonModel):
             context.artifacts["user_tower"], map_location=self.device
         )
         self.user_tower.eval()
-        self.vsc = VectorSearchClient(
-            workspace_url=os.environ["DATABRICKS_HOST"],
-            service_principal_client_id=os.environ["DATABRICKS_CLIENT_ID"],
-            service_principal_client_secret=os.environ["DATABRICKS_CLIENT_SECRET"],
-        )
+        # Automatic authentication passthrough: Databricks injects short-lived
+        # M2M OAuth credentials when the model is served behind an endpoint
+        # with resources=[DatabricksVectorSearchIndex(...)]. No manual SP needed.
+        self.vsc = VectorSearchClient()
         self.vs_endpoint = self.config["vs_endpoint"]
         self.vs_index = (
             f"{self.config['catalog']}.{self.config['schema']}"
