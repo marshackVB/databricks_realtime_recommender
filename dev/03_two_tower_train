@@ -1,0 +1,3130 @@
+# Databricks notebook source
+# DBTITLE 1,Two-Tower Recommender — Train & Deploy (v2)
+# MAGIC %md
+# MAGIC # Two-Tower Recommender — Train & Deploy (v2)
+# MAGIC
+# MAGIC Adapted from `03_two_tower_train_log_deploy` with key architecture changes:
+# MAGIC * **Shared embeddings** — product ID and brand embeddings shared across both towers
+# MAGIC * **Sequence encoding** — UserTower consumes `session_recent_products` (array of 10 IDs) and `session_recent_brands` (array of 5 brands) via mean-pooled shared embeddings
+# MAGIC * **12 user numerics** — adds `session_view_count`, `session_cart_count`, `session_purchase_count`
+# MAGIC * **`session_cart_value`** now comes from StreamSource (not computed at training time)
+
+# COMMAND ----------
+
+# DBTITLE 1,Install dependencies
+# MAGIC %pip install databricks-feature-engineering>=0.16.0 databricks-vectorsearch torch scipy --quiet
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# DBTITLE 1,Config + imports
+import os, sys, yaml, json, math
+import numpy as np
+import pandas as pd
+import mlflow
+import torch
+import torch.nn as nn
+import torch.nn.functional as TF
+from torch.utils.data import IterableDataset, DataLoader
+from pyspark.sql import functions as F
+from databricks.feature_engineering import FeatureEngineeringClient
+import glob, random
+import pyarrow.parquet as pq
+
+fe = FeatureEngineeringClient()
+
+config_path = os.path.join(os.getcwd(), "config.yml")
+with open(config_path) as f:
+    config = yaml.safe_load(f)
+
+CATALOG = config["catalog"]
+SCHEMA = config["schema"]
+PRODUCT_TRAIN_TABLE = f"{CATALOG}.{SCHEMA}.{config['product_train_table']}"
+SESSION_TRAIN_TABLE = f"{CATALOG}.{SCHEMA}.{config['session_train_table']}"
+EVALUATION_TABLE = f"{CATALOG}.{SCHEMA}.{config['eval_table']}"
+EMBED_DIM = config["embed_dim"]
+BATCH_SIZE = config["batch_size"]
+NUM_EPOCHS = config["num_epochs"]
+VS_ENDPOINT = config["vs_endpoint"]
+VS_INDEX = f"{CATALOG}.{SCHEMA}.{config['vs_index_name']}"
+EMBEDDING_TABLE = f"{CATALOG}.{SCHEMA}._two_tower_item_embeddings"
+
+mlflow.set_experiment(config["mlflow_experiment"])
+
+print(f"Catalog:   {CATALOG}")
+print(f"Schema:    {SCHEMA}")
+print(f"Embed dim: {EMBED_DIM}")
+print(f"Epochs:    {NUM_EPOCHS}")
+print(f"Batch:     {BATCH_SIZE}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Read persisted training tables from Delta
+# ---------------------------------------------------------------------------
+# Read persisted training/eval tables (written by 02_feature_definitions).
+# The training set was split into per-tower tables; rejoin on common columns
+# to reconstruct the full 33-column combined feature set.
+# ---------------------------------------------------------------------------
+_prod = spark.table(PRODUCT_TRAIN_TABLE)
+_sess = spark.table(SESSION_TRAIN_TABLE)
+
+_common = sorted(set(_prod.columns) & set(_sess.columns))
+_sess_only = [c for c in _sess.columns if c not in set(_prod.columns)]
+
+train_df = _prod.join(_sess.select(*_common, *_sess_only), on=_common, how="inner")
+eval_df = spark.table(EVALUATION_TABLE)
+
+print(f"Train: {train_df.count():,} rows, {len(train_df.columns)} columns")
+print(f"Eval:  {eval_df.count():,} rows, {len(eval_df.columns)} columns")
+
+# COMMAND ----------
+
+# DBTITLE 1,Build vocabularies from training data
+# --- Build vocabulary maps from TRAIN only (0 = <PAD>/<UNK>) ---
+def build_vocab(sdf, col):
+    vals = [row[col] for row in sdf.select(col).distinct().collect() if row[col] is not None]
+    return {v: i + 1 for i, v in enumerate(sorted(vals))}
+
+item_vocab = build_vocab(train_df, "product_id")
+category_vocab = build_vocab(train_df, "item_category_l1")
+category_l2_vocab = build_vocab(train_df, "item_category_l2")
+category_l3_vocab = build_vocab(train_df, "item_category_l3")
+brand_vocab = build_vocab(train_df, "item_brand")
+
+vocabs = {
+    "item_vocab": item_vocab,
+    "category_vocab": category_vocab,
+    "category_l2_vocab": category_l2_vocab,
+    "category_l3_vocab": category_l3_vocab,
+    "brand_vocab": brand_vocab,
+}
+print(f"\nVocabs — items: {len(item_vocab)}, cat_l1: {len(category_vocab)}, "
+      f"cat_l2: {len(category_l2_vocab)}, cat_l3: {len(category_l3_vocab)}, "
+      f"brands: {len(brand_vocab)}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Feature transforms (v2 — handles sequences)
+# ---------------------------------------------------------------------------
+# Updated transforms: adds 3 new session numerics + sequence processing for
+# session_recent_products (array<int>) and session_recent_brands (array<str>).
+# ---------------------------------------------------------------------------
+
+MAX_RECENT_PRODUCTS = 10
+MAX_RECENT_BRANDS = 5
+
+def pad_sequence(seq, max_len, pad_val=0):
+    """Pad/truncate a sequence to fixed length."""
+    if seq is None or (isinstance(seq, float) and math.isnan(seq)):
+        return [pad_val] * max_len
+    seq = list(seq)[:max_len]
+    return seq + [pad_val] * (max_len - len(seq))
+
+def make_mask(seq, max_len):
+    """Binary mask: 1.0 where real values, 0.0 where padding."""
+    if seq is None or (isinstance(seq, float) and math.isnan(seq)):
+        return [0.0] * max_len
+    n = min(len(list(seq)), max_len)
+    return [1.0] * n + [0.0] * (max_len - n)
+
+
+def transform_item_features(pdf, vocabs):
+    """Raw Feature View columns → item tower model inputs."""
+    df = pdf.copy()
+    df["item_log_price"] = df["item_log_price"].fillna(0.0)
+    df["item_popularity"] = np.log1p(df["item_view_count"].fillna(0))
+    df["item_conversion_rate"] = (
+        (df["item_purchase_count"].fillna(0) + 1) / (df["item_view_count"].fillna(0) + 10)
+    )
+    df["item_cart_to_purchase_rate"] = (
+        (df["item_purchase_count"].fillna(0) + 1) / (df["item_cart_count"].fillna(0) + 10)
+    )
+    cat1_range = (df["category_l1_max_price"] - df["category_l1_min_price"]).clip(lower=1e-6)
+    df["price_pct_rank"] = ((df["item_price"] - df["category_l1_min_price"]) / cat1_range).fillna(0.5)
+    cat2_range = (df["category_l2_max_price"] - df["category_l2_min_price"]).clip(lower=1e-6)
+    df["price_pct_rank_l2"] = ((df["item_price"] - df["category_l2_min_price"]) / cat2_range).fillna(0.5)
+    if "event_time" in df.columns and "item_recency" in df.columns:
+        event_dates = pd.to_datetime(df["event_time"]).dt.normalize()
+        recency_dates = pd.to_datetime(df["item_recency"]).dt.normalize()
+        df["item_recency_val"] = (1.0 / (1.0 + (event_dates - recency_dates).dt.days)).fillna(0.0)
+    else:
+        df["item_recency_val"] = 0.0
+    # Vocab indices
+    df["item_idx"] = df["product_id"].map(vocabs["item_vocab"]).fillna(0).astype(int)
+    df["category_idx"] = df["item_category_l1"].map(vocabs["category_vocab"]).fillna(0).astype(int)
+    df["category_l2_idx"] = df["item_category_l2"].map(vocabs["category_l2_vocab"]).fillna(0).astype(int)
+    df["category_l3_idx"] = df["item_category_l3"].map(vocabs["category_l3_vocab"]).fillna(0).astype(int)
+    df["brand_idx"] = df["item_brand"].map(vocabs["brand_vocab"]).fillna(0).astype(int)
+    return df
+
+
+def transform_user_features(pdf, vocabs):
+    """Raw Feature View columns → user tower model inputs.
+    Now handles 8 session numerics + cyclical time + sequence features."""
+    df = pdf.copy()
+
+    # --- 8 scalar session features ---
+    for col in ["session_event_count", "session_avg_price", "session_price_stddev",
+                "session_total_value", "session_cart_value",
+                "session_view_count", "session_cart_count", "session_purchase_count"]:
+        df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0.0)
+
+    # --- Cyclical time encoding ---
+    h = pd.to_numeric(df.get("hour_of_day", 0), errors="coerce").fillna(0)
+    d = pd.to_numeric(df.get("day_of_week", 0), errors="coerce").fillna(0)
+    df["hour_sin"] = np.sin(2 * math.pi * h / 24)
+    df["hour_cos"] = np.cos(2 * math.pi * h / 24)
+    df["dow_sin"] = np.sin(2 * math.pi * d / 7)
+    df["dow_cos"] = np.cos(2 * math.pi * d / 7)
+
+    # --- Sequence features: recent products (array<int> → padded indices + mask) ---
+    item_v = vocabs["item_vocab"]
+    df["recent_product_ids"] = df["session_recent_products"].apply(
+        lambda arr: pad_sequence(
+            [item_v.get(int(x), 0) for x in arr] if arr is not None and not (isinstance(arr, float) and math.isnan(arr)) else None,
+            MAX_RECENT_PRODUCTS,
+        )
+    )
+    df["recent_product_mask"] = df["session_recent_products"].apply(
+        lambda arr: make_mask(arr, MAX_RECENT_PRODUCTS)
+    )
+
+    # --- Sequence features: recent brands (array<str> → vocab indices → padded + mask) ---
+    brand_v = vocabs["brand_vocab"]
+    df["recent_brand_ids"] = df["session_recent_brands"].apply(
+        lambda arr: pad_sequence(
+            [brand_v.get(x, 0) for x in arr] if arr is not None and not (isinstance(arr, float) and math.isnan(arr)) else None,
+            MAX_RECENT_BRANDS,
+        )
+    )
+    df["recent_brand_mask"] = df["session_recent_brands"].apply(
+        lambda arr: make_mask(arr, MAX_RECENT_BRANDS)
+    )
+    return df
+
+
+def transform_all_features(pdf, vocabs):
+    """Combined transform for mapInPandas."""
+    df = transform_item_features(pdf, vocabs)
+    return transform_user_features(df, vocabs)
+
+print("Transforms defined (v2 — with sequence processing)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Transform, shuffle, and export to Parquet
+# ---------------------------------------------------------------------------
+# Transform in Spark (distributed), shuffle, export to Parquet in a UC Volume.
+#
+# 1. mapInPandas applies feature transforms on Spark executors (parallel).
+# 2. Select only the columns the model reads.
+# 3. Shuffle rows before writing — the Delta table is ordered by session/time,
+#    so consecutive rows share sessions. With in-batch negatives, that means
+#    the "negatives" would be products the user actually viewed.
+# 4. Write Parquet to a UC Volume. The training loop reads these files
+#    directly via PyArrow on the local FUSE mount — no toPandas() needed.
+# ---------------------------------------------------------------------------
+import time as _time
+from pyspark.sql.types import (
+    StructType, StructField, DoubleType, IntegerType, ArrayType, FloatType,
+)
+
+VOLUME_BASE = config.get("volume_base", "/Volumes/shared/mlc_schema/recommender_data")
+TRAIN_PARQUET_PATH = f"{VOLUME_BASE}/session_train"
+EVAL_PARQUET_PATH = f"{VOLUME_BASE}/session_eval"
+NUM_PARQUET_FILES = 64
+
+# --- Model-ready columns to export ---
+ITEM_COLS = [
+    "item_idx", "category_idx", "category_l2_idx", "category_l3_idx", "brand_idx",
+    "item_log_price", "price_pct_rank", "price_pct_rank_l2",
+    "item_popularity", "item_conversion_rate", "item_cart_to_purchase_rate",
+    "item_recency_val",
+]
+USER_NUMERIC_COLS = [
+    "session_event_count", "session_avg_price", "session_price_stddev",
+    "session_total_value", "session_cart_value",
+    "session_view_count", "session_cart_count", "session_purchase_count",
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+]
+SEQ_COLS = [
+    "recent_product_ids", "recent_product_mask",
+    "recent_brand_ids", "recent_brand_mask",
+]
+MODEL_COLUMNS = ITEM_COLS + USER_NUMERIC_COLS + SEQ_COLS
+
+# --- Output schema for mapInPandas ---
+derived_fields = [
+    StructField("item_popularity", DoubleType()),
+    StructField("item_conversion_rate", DoubleType()),
+    StructField("item_cart_to_purchase_rate", DoubleType()),
+    StructField("price_pct_rank", DoubleType()),
+    StructField("price_pct_rank_l2", DoubleType()),
+    StructField("item_recency_val", DoubleType()),
+    StructField("hour_sin", DoubleType()),
+    StructField("hour_cos", DoubleType()),
+    StructField("dow_sin", DoubleType()),
+    StructField("dow_cos", DoubleType()),
+    StructField("item_idx", IntegerType()),
+    StructField("category_idx", IntegerType()),
+    StructField("category_l2_idx", IntegerType()),
+    StructField("category_l3_idx", IntegerType()),
+    StructField("brand_idx", IntegerType()),
+    StructField("recent_product_ids", ArrayType(IntegerType())),
+    StructField("recent_product_mask", ArrayType(FloatType())),
+    StructField("recent_brand_ids", ArrayType(IntegerType())),
+    StructField("recent_brand_mask", ArrayType(FloatType())),
+]
+output_schema = StructType(list(train_df.schema.fields) + derived_fields)
+
+def make_transform_fn(vocabs):
+    def _transform(iterator):
+        for pdf in iterator:
+            yield transform_all_features(pdf, vocabs)
+    return _transform
+
+# --- Transform + shuffle + export training data ---
+_t0 = _time.time()
+train_sdf = (
+    train_df
+    .mapInPandas(make_transform_fn(vocabs), schema=output_schema)
+    .select(*MODEL_COLUMNS, "event_time")
+    .repartition(NUM_PARQUET_FILES, F.rand(seed=42))
+    .sortWithinPartitions(F.rand(seed=7))
+)
+train_sdf.write.mode("overwrite").parquet(TRAIN_PARQUET_PATH)
+train_row_count = sum(pq.ParquetFile(f).metadata.num_rows for f in glob.glob(f"{TRAIN_PARQUET_PATH}/*.parquet"))
+print(f"Train exported: {train_row_count:,} rows → {TRAIN_PARQUET_PATH}")
+print(f"  {NUM_PARQUET_FILES} shuffled Parquet files in {_time.time() - _t0:.1f}s")
+
+# --- Transform + export eval data (no shuffle needed) ---
+_t1 = _time.time()
+eval_sdf = (
+    eval_df
+    .mapInPandas(make_transform_fn(vocabs), schema=output_schema)
+    .select(*MODEL_COLUMNS, "event_time")
+)
+eval_sdf.write.mode("overwrite").parquet(EVAL_PARQUET_PATH)
+eval_row_count = sum(pq.ParquetFile(f).metadata.num_rows for f in glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet"))
+print(f"Eval exported:  {eval_row_count:,} rows → {EVAL_PARQUET_PATH}")
+print(f"  in {_time.time() - _t1:.1f}s")
+# --- Export evaluation lookups (read by evaluation.load_evaluation_lookups) ---
+# Read exported Parquet via pandas (not Spark) to avoid stale file-listing
+# caches that can occur after mode("overwrite") writes to the same path.
+# Item features dedup: sort by event_time desc, keep first per item — picks
+# the latest feature values, matching the Spark window-function approach in
+# evaluation.export_evaluation_inputs().
+import shutil
+
+def _clean_and_write(df, path):
+    """Write a pandas DataFrame as a single Parquet file, removing any prior directory."""
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    df.to_parquet(path, index=False)
+
+_train_items = pd.read_parquet(TRAIN_PARQUET_PATH, columns=ITEM_COLS + ["event_time"])
+_eval_idx = pd.read_parquet(EVAL_PARQUET_PATH, columns=["item_idx"])
+
+# Item features: one row per item, latest feature values by event_time.
+# Multi-day training data has time-varying features (popularity, recency, ...),
+# so we pick the latest observation per item to match what the serving index holds.
+_item_feat = (_train_items
+    .sort_values("event_time", ascending=False)
+    .drop_duplicates(subset=["item_idx"], keep="first")
+    [ITEM_COLS])
+_clean_and_write(_item_feat, f"{VOLUME_BASE}/item_features")
+print(f"Item features:  {len(_item_feat):,} items")
+
+# Training interaction count per item
+_tc = _train_items.groupby("item_idx").size().reset_index(name="count")
+_clean_and_write(_tc, f"{VOLUME_BASE}/train_item_counts")
+print(f"Train counts:   {len(_tc):,} items")
+
+# Distinct items in eval
+_ei = _eval_idx.drop_duplicates()
+_clean_and_write(_ei, f"{VOLUME_BASE}/eval_items")
+print(f"Eval items:     {len(_ei):,} unique items")
+
+print(f"\nTotal export time: {_time.time() - _t0:.1f}s")
+
+# COMMAND ----------
+
+# DBTITLE 1,Architecture: shared embeddings + sequence encoding
+# MAGIC %md
+# MAGIC #### Architecture changes from v1
+# MAGIC
+# MAGIC The original UserTower was a pure MLP over 9 scalar numerics. The new features introduce **variable-length sequences** (`session_recent_products`, `session_recent_brands`) that require structural changes:
+# MAGIC
+# MAGIC 1. **SharedEmbeddings** — Product ID and brand embedding tables are shared between towers. When the user tower encodes "recently browsed product 1234", it uses the *same* embedding as when the item tower represents "candidate product 1234". This creates a natural semantic bridge: the dot product between user and item embeddings measures overlap in the shared product/brand space.
+# MAGIC
+# MAGIC 2. **Mean-pooled sequence encoding** — Each sequence is embedded, masked (to ignore padding), and mean-pooled into a fixed-size vector. This is the standard approach used by YouTube DNN, DSSM, and most production two-tower models. Attention pooling is a natural upgrade path.
+# MAGIC
+# MAGIC 3. **12 user numerics** (was 9) — Three new engagement counters (`session_view_count`, `session_cart_count`, `session_purchase_count`) add granular intent signal beyond the original aggregate stats.
+
+# COMMAND ----------
+
+# DBTITLE 1,Define two-tower model (v2)
+# ---------------------------------------------------------------------------
+# Two-tower model v2: shared embeddings + sequence encoding in user tower.
+# ---------------------------------------------------------------------------
+
+def masked_mean_pool(embeddings, mask):
+    """Mean-pool embeddings over sequence dim, respecting padding mask.
+    embeddings: (B, seq_len, D)
+    mask:       (B, seq_len)
+    returns:    (B, D)
+    """
+    mask_expanded = mask.unsqueeze(-1)  # (B, seq_len, 1)
+    summed = (embeddings * mask_expanded).sum(dim=1)  # (B, D)
+    counts = mask.sum(dim=1, keepdim=True).clamp(min=1)  # (B, 1)
+    return summed / counts
+
+
+class SharedEmbeddings(nn.Module):
+    """Embedding tables shared across both towers."""
+    def __init__(self, item_vocab_size, brand_vocab_size, embed_dim):
+        super().__init__()
+        self.item_emb = nn.Embedding(item_vocab_size, embed_dim, padding_idx=0)
+        self.brand_emb = nn.Embedding(brand_vocab_size, embed_dim // 2, padding_idx=0)
+
+
+class ItemTower(nn.Module):
+    def __init__(self, shared_emb, category_vocab_size, category_l2_vocab_size,
+                 category_l3_vocab_size, embed_dim=64):
+        super().__init__()
+        self.shared = shared_emb
+        self.category_emb = nn.Embedding(category_vocab_size, embed_dim // 2)
+        self.category_l2_emb = nn.Embedding(category_l2_vocab_size, embed_dim // 4)
+        self.category_l3_emb = nn.Embedding(category_l3_vocab_size, embed_dim // 4)
+        numeric_dim = 7  # log_price, price_pct_rank, price_pct_rank_l2,
+                          # popularity, conversion, cart_to_purchase, recency
+        mlp_in = embed_dim + (embed_dim // 2) * 2 + (embed_dim // 4) * 2 + numeric_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_in, 256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, embed_dim),
+        )
+
+    def forward(self, item_id, category_id, category_l2_id, category_l3_id, brand_id,
+                log_price, price_pct_rank, price_pct_rank_l2, item_popularity,
+                item_conversion_rate, item_cart_to_purchase_rate, item_recency):
+        x = torch.cat([
+            self.shared.item_emb(item_id),
+            self.category_emb(category_id),
+            self.category_l2_emb(category_l2_id),
+            self.category_l3_emb(category_l3_id),
+            self.shared.brand_emb(brand_id),
+            log_price.unsqueeze(-1), price_pct_rank.unsqueeze(-1),
+            price_pct_rank_l2.unsqueeze(-1), item_popularity.unsqueeze(-1),
+            item_conversion_rate.unsqueeze(-1), item_cart_to_purchase_rate.unsqueeze(-1),
+            item_recency.unsqueeze(-1),
+        ], dim=-1)
+        return TF.normalize(self.mlp(x), p=2, dim=-1)
+
+
+class UserTower(nn.Module):
+    """User tower v2: scalar numerics + mean-pooled sequence embeddings.
+    Sequences use SHARED embeddings from the item tower, creating a natural
+    semantic bridge between 'what the user browsed' and 'candidate item'."""
+    def __init__(self, shared_emb, embed_dim=64):
+        super().__init__()
+        self.shared = shared_emb
+        numeric_dim = 12  # 8 session scalars + 4 cyclical time
+        seq_dim = embed_dim + embed_dim // 2  # pooled products + pooled brands
+        self.mlp = nn.Sequential(
+            nn.Linear(numeric_dim + seq_dim, 256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, embed_dim),
+        )
+
+    def forward(self, numeric, recent_product_ids, recent_product_mask,
+                recent_brand_ids, recent_brand_mask):
+        # Mean-pool product history (B, 10) → embed → pool → (B, embed_dim)
+        prod_emb = self.shared.item_emb(recent_product_ids)
+        prod_pooled = masked_mean_pool(prod_emb, recent_product_mask)
+
+        # Mean-pool brand history (B, 5) → embed → pool → (B, embed_dim//2)
+        brand_emb = self.shared.brand_emb(recent_brand_ids)
+        brand_pooled = masked_mean_pool(brand_emb, recent_brand_mask)
+
+        x = torch.cat([numeric, prod_pooled, brand_pooled], dim=-1)
+        return TF.normalize(self.mlp(x), p=2, dim=-1)
+
+
+class TwoTowerModel(nn.Module):
+    def __init__(self, shared_emb, item_tower, user_tower, temperature=0.05):
+        super().__init__()
+        self.shared_emb = shared_emb
+        self.item_tower = item_tower
+        self.user_tower = user_tower
+        self.temperature = temperature
+
+    def forward(self, user_batch, item_batch):
+        user_emb = self.user_tower(**user_batch)
+        item_emb = self.item_tower(**item_batch)
+        logits = user_emb @ item_emb.T / self.temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        loss = TF.cross_entropy(logits, labels)
+        return loss, user_emb, item_emb
+
+
+# --- Instantiate ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+shared_emb = SharedEmbeddings(
+    item_vocab_size=len(item_vocab) + 1,
+    brand_vocab_size=len(brand_vocab) + 1,
+    embed_dim=EMBED_DIM,
+)
+item_tower = ItemTower(
+    shared_emb=shared_emb,
+    category_vocab_size=len(category_vocab) + 1,
+    category_l2_vocab_size=len(category_l2_vocab) + 1,
+    category_l3_vocab_size=len(category_l3_vocab) + 1,
+    embed_dim=EMBED_DIM,
+)
+user_tower = UserTower(shared_emb=shared_emb, embed_dim=EMBED_DIM)
+model = TwoTowerModel(shared_emb, item_tower, user_tower).to(device)
+
+total_params = sum(p.numel() for p in model.parameters())
+shared_params = sum(p.numel() for p in shared_emb.parameters())
+print(f"Device: {device}")
+print(f"Total parameters:  {total_params:,}")
+print(f"Shared parameters: {shared_params:,} (product + brand embeddings)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Parquet batch training loop
+# ---------------------------------------------------------------------------
+# Parquet batch training loop.
+#
+# Reads pre-shuffled Parquet files from the UC Volume via PyArrow.
+# Each iter_batches call reads a whole row group as columnar arrays,
+# avoiding the row-at-a-time overhead of a standard PyTorch Dataset.
+# Memory stays at O(batch_size × num_workers), not O(dataset).
+# ---------------------------------------------------------------------------
+import time as _time
+
+# Column name in Parquet → kwarg name in ItemTower.forward()
+ITEM_COL_MAP = {
+    "item_idx": "item_id",
+    "category_idx": "category_id",
+    "category_l2_idx": "category_l2_id",
+    "category_l3_idx": "category_l3_id",
+    "brand_idx": "brand_id",
+    "item_log_price": "log_price",
+    "price_pct_rank": "price_pct_rank",
+    "price_pct_rank_l2": "price_pct_rank_l2",
+    "item_popularity": "item_popularity",
+    "item_conversion_rate": "item_conversion_rate",
+    "item_cart_to_purchase_rate": "item_cart_to_purchase_rate",
+    "item_recency_val": "item_recency",
+}
+
+SCALAR_COLS = list(ITEM_COL_MAP.keys()) + USER_NUMERIC_COLS
+
+
+class ParquetBatches(IterableDataset):
+    """Stream whole batches from pre-shuffled Parquet files via PyArrow."""
+    def __init__(self, path, batch_size, scalar_cols, seq_cols):
+        self.files = sorted(glob.glob(f"{path}/*.parquet"))
+        self.batch_size = batch_size
+        self.scalar_cols = scalar_cols
+        self.seq_cols = seq_cols
+        self.all_cols = scalar_cols + seq_cols
+        self.epoch = 0
+
+    def __iter__(self):
+        files = list(self.files)
+        random.Random(self.epoch).shuffle(files)  # new file order each epoch
+        info = torch.utils.data.get_worker_info()
+        if info:  # each worker takes its own files
+            files = files[info.id::info.num_workers]
+        for f in files:
+            for rb in pq.ParquetFile(f).iter_batches(
+                self.batch_size, columns=self.all_cols
+            ):
+                batch = {}
+                for c in self.scalar_cols:
+                    batch[c] = torch.from_numpy(
+                        rb.column(c).to_numpy(zero_copy_only=False)
+                    )
+                for c in self.seq_cols:
+                    # Fixed-length list columns → stack into 2D tensor
+                    arr = rb.column(c).to_pandas().values
+                    batch[c] = torch.from_numpy(np.stack(arr))
+                yield batch
+
+
+def parquet_batch_to_model_inputs(batch, device):
+    """Convert a ParquetBatches dict to (user_batch, item_batch) on device."""
+    item_batch = {}
+    for col, kwarg in ITEM_COL_MAP.items():
+        dtype = torch.long if col.endswith("idx") else torch.float32
+        item_batch[kwarg] = batch[col].to(dtype=dtype, device=device)
+
+    user_numeric = torch.stack(
+        [batch[c].float() for c in USER_NUMERIC_COLS], dim=-1
+    ).to(device)
+
+    user_batch = {
+        "numeric": user_numeric,
+        "recent_product_ids": batch["recent_product_ids"].long().to(device),
+        "recent_product_mask": batch["recent_product_mask"].float().to(device),
+        "recent_brand_ids": batch["recent_brand_ids"].long().to(device),
+        "recent_brand_mask": batch["recent_brand_mask"].float().to(device),
+    }
+    return user_batch, item_batch
+
+
+# --- Build DataLoader ---
+train_ds = ParquetBatches(
+    TRAIN_PARQUET_PATH, batch_size=BATCH_SIZE,
+    scalar_cols=SCALAR_COLS, seq_cols=SEQ_COLS,
+)
+loader = DataLoader(train_ds, batch_size=None, num_workers=4, pin_memory=True)
+print(f"Parquet training loader: {len(train_ds.files)} files, "
+      f"batch_size={BATCH_SIZE}, num_workers=4")
+
+# --- Training loop ---
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+train_history = []
+_train_t0 = _time.time()
+
+for epoch in range(1, NUM_EPOCHS + 1):
+    train_ds.epoch = epoch  # new file order each epoch
+    model.train()
+    total_loss = 0
+    n_batches = 0
+
+    for batch in loader:
+        # Skip incomplete last batch (contrastive loss needs full batch)
+        first_key = next(iter(batch))
+        if batch[first_key].shape[0] < BATCH_SIZE:
+            continue
+
+        user_batch, item_batch = parquet_batch_to_model_inputs(batch, device)
+
+        optimizer.zero_grad()
+        loss, _, _ = model(user_batch, item_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        n_batches += 1
+
+        if n_batches % 50 == 0:
+            print(f"  Epoch {epoch}/{NUM_EPOCHS} — Batch {n_batches}: loss={loss.item():.4f}")
+
+    avg_loss = total_loss / max(n_batches, 1)
+    train_history.append({"epoch": epoch, "train_loss": avg_loss})
+    print(f"Epoch {epoch}/{NUM_EPOCHS} avg train loss: {avg_loss:.4f} ({n_batches} batches)\n")
+
+_train_elapsed = _time.time() - _train_t0
+print(f"Training complete ({NUM_EPOCHS} epochs) in {_train_elapsed:.1f}s ({_train_elapsed/60:.1f} min)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Run full evaluation suite
+# ---------------------------------------------------------------------------
+# Run full evaluation suite (single pass over eval Parquet files).
+#
+# Uses evaluation.py's self-contained I/O functions:
+#   load_evaluation_lookups  — reads item_features, train_counts, eval_items
+#   parquet_eval_batches     — streams (user_batch, item_batch) from Parquet
+#   run_full_evaluation      — single GPU pass for all metrics
+# ---------------------------------------------------------------------------
+import sys, importlib
+import torch
+
+_project_root = os.path.normpath(os.path.dirname(config_path))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+import evaluation
+importlib.reload(evaluation)
+from evaluation import (
+    load_evaluation_lookups, parquet_eval_batches,
+    load_cooccurrence_matrix,
+    run_full_evaluation, print_evaluation_summary,
+    print_masked_novel_summary,
+)
+
+# --- Load small lookup tables from Volume ---
+item_features, train_counts, eval_items = load_evaluation_lookups(VOLUME_BASE)
+print(f"Loaded lookups: {len(item_features):,} items, "
+      f"{len(train_counts):,} train counts, {len(eval_items):,} eval items")
+
+# --- User-tower column mapping for the eval Parquet loader ---
+# Sequence columns map directly to UserTower.forward() kwargs.
+# The 12 scalar columns (USER_NUMERIC_COLS from cell 7) are stacked
+# into a single "numeric" tensor of shape (B, 12).
+USER_EVAL_COLUMNS = {
+    "recent_product_ids": ("recent_product_ids", torch.long),
+    "recent_product_mask": ("recent_product_mask", torch.float32),
+    "recent_brand_ids": ("recent_brand_ids", torch.long),
+    "recent_brand_mask": ("recent_brand_mask", torch.float32),
+}
+
+def make_eval_loader():
+    return parquet_eval_batches(
+        EVAL_PARQUET_PATH,
+        user_columns=USER_EVAL_COLUMNS,
+        batch_size=BATCH_SIZE,
+        numeric_columns=USER_NUMERIC_COLS,
+        numeric_kwarg="numeric",
+    )
+
+# --- Load co-occurrence matrix ---
+try:
+    cooc_matrix = load_cooccurrence_matrix(VOLUME_BASE)
+except FileNotFoundError:
+    cooc_matrix = None
+    print("No co-occurrence matrix found — skipping co-occurrence baseline")
+
+# --- Run evaluation (model + masked + co-occurrence) ---
+print("\nRunning full evaluation suite...")
+eval_metrics, eval_details = run_full_evaluation(
+    model, item_features, train_counts, eval_items,
+    make_eval_loader(), device,
+    eval_loader_fn=make_eval_loader,
+    eval_path=EVAL_PARQUET_PATH,
+    cooc_matrix=cooc_matrix,
+)
+
+print_evaluation_summary(eval_metrics, eval_details)
+print_masked_novel_summary(eval_metrics)
+
+# COMMAND ----------
+
+# DBTITLE 1,Log metrics + artifacts to MLflow
+# ---------------------------------------------------------------------------
+# Log training + evaluation metrics and traced model artifacts to MLflow.
+# fe.log_model (model registration with feature lineage) is deferred to a
+# separate deployment step that has Feature objects in scope.
+# ---------------------------------------------------------------------------
+import tempfile, json
+
+model.eval()
+_artifact_dir = tempfile.mkdtemp()
+
+# 1. Trace user tower (v2 signature: numeric + 4 sequence tensors)
+_dummy_numeric = torch.randn(1, 12).to(device)
+_dummy_prod_ids = torch.zeros(1, MAX_RECENT_PRODUCTS, dtype=torch.long).to(device)
+_dummy_prod_mask = torch.ones(1, MAX_RECENT_PRODUCTS).to(device)
+_dummy_brand_ids = torch.zeros(1, MAX_RECENT_BRANDS, dtype=torch.long).to(device)
+_dummy_brand_mask = torch.ones(1, MAX_RECENT_BRANDS).to(device)
+
+traced_user = torch.jit.trace(
+    model.user_tower,
+    (_dummy_numeric, _dummy_prod_ids, _dummy_prod_mask, _dummy_brand_ids, _dummy_brand_mask),
+)
+user_tower_path = f"{_artifact_dir}/user_tower_traced.pt"
+traced_user.save(user_tower_path)
+
+# 2. Trace item tower
+traced_item = torch.jit.trace(model.item_tower, (
+    torch.tensor([0], dtype=torch.long).to(device),
+    torch.tensor([0], dtype=torch.long).to(device),
+    torch.tensor([0], dtype=torch.long).to(device),
+    torch.tensor([0], dtype=torch.long).to(device),
+    torch.tensor([0], dtype=torch.long).to(device),
+    torch.tensor([3.5], dtype=torch.float32).to(device),
+    torch.tensor([0.5], dtype=torch.float32).to(device),
+    torch.tensor([0.5], dtype=torch.float32).to(device),
+    torch.tensor([5.0], dtype=torch.float32).to(device),
+    torch.tensor([0.1], dtype=torch.float32).to(device),
+    torch.tensor([0.05], dtype=torch.float32).to(device),
+    torch.tensor([0.5], dtype=torch.float32).to(device),
+))
+item_tower_path = f"{_artifact_dir}/item_tower_traced.pt"
+traced_item.save(item_tower_path)
+
+# 3. Save vocabs + config as artifacts
+vocabs_path = f"{_artifact_dir}/vocabs.json"
+with open(vocabs_path, "w") as f:
+    json.dump({k: {str(kk): vv for kk, vv in v.items()} for k, v in vocabs.items()}, f)
+
+pyfunc_config = {
+    "embed_dim": EMBED_DIM,
+    "user_numeric_features": USER_NUMERIC_COLS,
+    "max_recent_products": MAX_RECENT_PRODUCTS,
+    "max_recent_brands": MAX_RECENT_BRANDS,
+    "vs_endpoint": config["vs_endpoint"],
+    "vs_index_name": config["vs_index_name"],
+    "catalog": CATALOG,
+    "schema": SCHEMA,
+}
+pyfunc_config_path = f"{_artifact_dir}/pyfunc_config.json"
+with open(pyfunc_config_path, "w") as f:
+    json.dump(pyfunc_config, f)
+
+# 4. MLflow run — log everything
+mlflow.end_run()
+with mlflow.start_run(run_name="two_tower_v2_shared_emb") as run:
+    run_id = run.info.run_id
+
+    mlflow.log_params({
+        "catalog": CATALOG, "schema": SCHEMA,
+        "training_start_day": config["training_start_day"],
+        "training_end_day": config["training_end_day"],
+        "num_epochs": NUM_EPOCHS, "batch_size": BATCH_SIZE,
+        "embed_dim": EMBED_DIM,
+        "train_rows": train_row_count, "eval_rows": eval_row_count,
+        "architecture": "v2_shared_emb_sequences",
+        "user_numeric_dim": 12,
+        "max_recent_products": MAX_RECENT_PRODUCTS,
+        "max_recent_brands": MAX_RECENT_BRANDS,
+    })
+
+    for entry in train_history:
+        mlflow.log_metric("train_loss", entry["train_loss"], step=entry["epoch"])
+
+    # Log all evaluation metrics
+    mlflow.log_metrics(eval_metrics)
+
+    # Log traced towers + vocabs + config as artifacts
+    mlflow.log_artifact(user_tower_path, artifact_path="user_tower")
+    mlflow.log_artifact(item_tower_path, artifact_path="item_tower")
+    mlflow.log_artifact(vocabs_path, artifact_path="config")
+    mlflow.log_artifact(pyfunc_config_path, artifact_path="config")
+
+    print(f"Run: {run_id}")
+    print(f"Logged {len(eval_metrics)} eval metrics + {len(train_history)} train loss steps")
+    print(f"Artifacts: user_tower, item_tower, vocabs, pyfunc_config")
+
+# COMMAND ----------
+
+# DBTITLE 1,Generate item embeddings → Delta table
+# ---------------------------------------------------------------------------
+# Generate item embeddings from the trained item tower.
+# One embedding per unique product in the training data.
+# ---------------------------------------------------------------------------
+from pyspark.sql.types import ArrayType as SparkArrayType, FloatType as SparkFloatType
+
+model.eval()
+
+# Unique items from training data
+item_keys = train_pdf[["product_id", "item_idx", "category_idx", "category_l2_idx",
+                        "category_l3_idx", "brand_idx", "item_log_price",
+                        "price_pct_rank", "price_pct_rank_l2", "item_popularity",
+                        "item_conversion_rate", "item_cart_to_purchase_rate",
+                        "item_recency_val"]].drop_duplicates(subset=["product_id"])
+print(f"Unique products: {len(item_keys):,}")
+
+with torch.no_grad():
+    embs = model.item_tower(
+        item_id=torch.tensor(item_keys["item_idx"].values, dtype=torch.long).to(device),
+        category_id=torch.tensor(item_keys["category_idx"].values, dtype=torch.long).to(device),
+        category_l2_id=torch.tensor(item_keys["category_l2_idx"].values, dtype=torch.long).to(device),
+        category_l3_id=torch.tensor(item_keys["category_l3_idx"].values, dtype=torch.long).to(device),
+        brand_id=torch.tensor(item_keys["brand_idx"].values, dtype=torch.long).to(device),
+        log_price=torch.tensor(item_keys["item_log_price"].values, dtype=torch.float32).to(device),
+        price_pct_rank=torch.tensor(item_keys["price_pct_rank"].values, dtype=torch.float32).to(device),
+        price_pct_rank_l2=torch.tensor(item_keys["price_pct_rank_l2"].values, dtype=torch.float32).to(device),
+        item_popularity=torch.tensor(item_keys["item_popularity"].values, dtype=torch.float32).to(device),
+        item_conversion_rate=torch.tensor(item_keys["item_conversion_rate"].values, dtype=torch.float32).to(device),
+        item_cart_to_purchase_rate=torch.tensor(item_keys["item_cart_to_purchase_rate"].values, dtype=torch.float32).to(device),
+        item_recency=torch.tensor(item_keys["item_recency_val"].values, dtype=torch.float32).to(device),
+    ).cpu().numpy()
+
+item_keys = item_keys.copy()
+item_keys["embedding"] = [emb.tolist() for emb in embs]
+
+emb_sdf = spark.createDataFrame(
+    item_keys[["product_id", "embedding"]]
+).withColumn("embedding", F.col("embedding").cast(SparkArrayType(SparkFloatType())))
+
+emb_sdf.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(EMBEDDING_TABLE)
+print(f"Wrote {emb_sdf.count():,} embeddings \u2192 {EMBEDDING_TABLE}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Create/sync Vector Search index
+# ---------------------------------------------------------------------------
+# Create or sync the Vector Search index from the embeddings Delta table.
+# ---------------------------------------------------------------------------
+from databricks.vector_search.client import VectorSearchClient
+
+vsc = VectorSearchClient()
+
+try:
+    idx_info = vsc.get_index(endpoint_name=VS_ENDPOINT, index_name=VS_INDEX)
+    print(f"Index {VS_INDEX} exists. Syncing...")
+    idx_info.sync()
+except Exception as e:
+    if "not found" in str(e).lower() or "does not exist" in str(e).lower() or "RESOURCE_DOES_NOT_EXIST" in str(e):
+        print(f"Creating index {VS_INDEX}...")
+        vsc.create_delta_sync_index(
+            endpoint_name=VS_ENDPOINT,
+            index_name=VS_INDEX,
+            source_table_name=EMBEDDING_TABLE,
+            primary_key="product_id",
+            embedding_vector_column="embedding",
+            embedding_dimension=EMBED_DIM,
+            pipeline_type="TRIGGERED",
+        )
+        print(f"Index {VS_INDEX} created on endpoint {VS_ENDPOINT}")
+    else:
+        raise e
+
+print(f"\nVector Search index sync initiated.")
+print(f"  Endpoint: {VS_ENDPOINT}")
+print(f"  Index:    {VS_INDEX}")
+print(f"  Source:   {EMBEDDING_TABLE}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Co-occurrence baseline evaluation (GPU, tie-break corrected)
+# ---------------------------------------------------------------------------
+# Co-occurrence baseline: GPU-accelerated scatter-add approach.
+#
+# Builds a top-K neighbor index from the co-occurrence matrix, then uses
+# GPU scatter_add_ to score all 154K candidates per eval row.
+# Model-independent — only needs the co-occurrence matrix and eval Parquet.
+# ---------------------------------------------------------------------------
+import sys, os, importlib, pickle, time as _time
+import numpy as np
+import torch
+import pyarrow.parquet as pq
+import glob
+
+VOLUME_BASE = config.get("volume_base", "/Volumes/shared/mlc_schema/recommender_data")
+EVAL_PARQUET_PATH = f"{VOLUME_BASE}/session_eval"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+
+# --- Load cooc matrix and build GPU neighbor lookup ---
+with open(f"{VOLUME_BASE}/cooc_matrix.pkl", "rb") as f:
+    cooc_cpu = pickle.load(f)
+cooc_size = cooc_cpu.shape[0]
+
+TOP_K = 150
+print(f"Building top-{TOP_K} neighbor index from {cooc_cpu.nnz:,} nnz...")
+_t0 = _time.time()
+
+nb_arr = np.zeros((cooc_size, TOP_K), dtype=np.int64)
+sc_arr = np.zeros((cooc_size, TOP_K), dtype=np.float32)
+for i in range(cooc_size):
+    s, e = cooc_cpu.indptr[i], cooc_cpu.indptr[i + 1]
+    n = e - s
+    if n == 0:
+        continue
+    if n <= TOP_K:
+        nb_arr[i, :n] = cooc_cpu.indices[s:e]
+        sc_arr[i, :n] = cooc_cpu.data[s:e]
+    else:
+        top = np.argpartition(cooc_cpu.data[s:e], -TOP_K)[-TOP_K:]
+        nb_arr[i] = cooc_cpu.indices[s:e][top]
+        sc_arr[i] = cooc_cpu.data[s:e][top]
+
+nb_gpu = torch.tensor(nb_arr, device=device)
+sc_gpu = torch.tensor(sc_arr, device=device)
+del nb_arr, sc_arr, cooc_cpu
+print(f"  Built in {_time.time()-_t0:.1f}s")
+
+# --- Eval loop ---
+ks = [10, 50, 100, 150, 200]
+mrr_nh, recall_nh = 0.0, {k: 0 for k in ks}
+mrr_rep, recall_rep = 0.0, {k: 0 for k in ks}
+count_nh, count_nf, count_rep = 0, 0, 0
+total = 0
+
+eval_files = sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet"))
+needed_cols = ["item_idx", "recent_product_ids", "recent_product_mask"]
+_t0 = _time.time()
+
+for fi, fpath in enumerate(eval_files):
+    for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed_cols):
+        item_idx = rb.column("item_idx").to_numpy(zero_copy_only=False)
+        rp = np.stack(rb.column("recent_product_ids").to_pandas().values)
+        rm = np.stack(rb.column("recent_product_mask").to_pandas().values)
+        B = len(item_idx)
+        total += B
+
+        # Classify rows (CPU)
+        has_hist = rm.sum(axis=1) > 0
+        is_repeat = np.zeros(B, dtype=bool)
+        for j in range(rp.shape[1]):
+            is_repeat |= ((rp[:, j] == item_idx) & (rm[:, j] > 0))
+        is_novel = ~is_repeat
+        is_nh = is_novel & has_hist
+        is_nf = is_novel & ~has_hist
+        count_nf += int(is_nf.sum())
+
+        # GPU scoring for rows with history
+        hist_idx = np.where(has_hist)[0]
+        if len(hist_idx) == 0:
+            continue
+
+        _rp = torch.tensor(rp[hist_idx], dtype=torch.long, device=device)
+        _rm = torch.tensor(rm[hist_idx], dtype=torch.float32, device=device)
+        _ti = torch.tensor(
+            np.clip(item_idx[hist_idx], 0, cooc_size - 1),
+            dtype=torch.long, device=device,
+        )
+        B_h = len(hist_idx)
+
+        # Gather top-K neighbors/scores for each recent item
+        gathered_nb = nb_gpu[_rp]                          # (B_h, 10, TOP_K)
+        gathered_sc = sc_gpu[_rp] * _rm.unsqueeze(-1)      # mask padding recent items
+
+        # Scatter-add into (B_h, cooc_size) score matrix
+        flat_nb = gathered_nb.reshape(B_h, -1)             # (B_h, 10*TOP_K)
+        flat_sc = gathered_sc.reshape(B_h, -1)
+        scores = torch.zeros(B_h, cooc_size, device=device)
+        scores.scatter_add_(1, flat_nb, flat_sc)
+
+        # Mask seen items for novel rows
+        _is_nh_h = torch.tensor(is_nh[hist_idx], dtype=torch.bool, device=device)
+        for j in range(_rp.shape[1]):
+            valid_j = (_rm[:, j] > 0) & _is_nh_h
+            rows_j = torch.where(valid_j)[0]
+            if len(rows_j) > 0:
+                cols_j = _rp[rows_j, j].clamp(0, cooc_size - 1)
+                scores[rows_j, cols_j] = -float("inf")
+
+        # Ranks with expected-rank tie-breaking
+        # Co-occ scores are integer-valued so many candidates share score 0.
+        # rank = n_greater + 1 + n_tied / 2  (expected rank, random tie-break)
+        tgt_scores = scores[torch.arange(B_h, device=device), _ti]
+        n_greater = (scores > tgt_scores.unsqueeze(1)).sum(dim=1)
+        n_tied = (scores == tgt_scores.unsqueeze(1)).sum(dim=1) - 1  # exclude target
+        ranks = n_greater + 1.0 + n_tied.float() / 2.0
+        rr = 1.0 / ranks
+
+        # Accumulate novel-hist
+        mrr_nh += rr[_is_nh_h].sum().item()
+        count_nh += int(_is_nh_h.sum().item())
+        for k in ks:
+            recall_nh[k] += int((ranks[_is_nh_h] <= k).sum().item())
+
+        # Accumulate repeat
+        _is_rep_h = torch.tensor(is_repeat[hist_idx], dtype=torch.bool, device=device)
+        mrr_rep += rr[_is_rep_h].sum().item()
+        count_rep += int(_is_rep_h.sum().item())
+        for k in ks:
+            recall_rep[k] += int((ranks[_is_rep_h] <= k).sum().item())
+
+        del scores, flat_nb, flat_sc, gathered_nb, gathered_sc  # free GPU mem
+
+    if (fi + 1) % 5 == 0 or fi == len(eval_files) - 1:
+        print(f"  File {fi+1}/{len(eval_files)}, {total:,} rows ({_time.time()-_t0:.0f}s)")
+
+_elapsed = _time.time() - _t0
+print(f"\nTotal: {_elapsed:.0f}s ({_elapsed/60:.1f} min)")
+
+# --- Print comparison table ---
+nh_mrr = mrr_nh / max(count_nh, 1)
+rep_mrr = mrr_rep / max(count_rep, 1)
+
+# Known masked metrics from prior evaluation run
+_m = {"mrr": 0.0777, "r10": 0.1773, "r50": 0.3212, "r100": 0.4050, "r150": 0.4533, "r200": 0.4879}
+_gp = {"mrr": 0.0160, "r10": 0.0335, "r50": 0.0893, "r100": 0.1337, "r150": 0.1650, "r200": 0.1892}
+_cp = {"mrr": 0.0313, "r10": 0.0660, "r50": 0.1744, "r100": 0.2620, "r150": 0.3214, "r200": 0.3648}
+
+print(f"\n{'='*85}")
+print(f"  CO-OCCURRENCE BASELINE (top-{TOP_K} neighbors, GPU scatter-add)")
+print(f"{'='*85}")
+
+print(f"\n  Has-history novel ({count_nh:,} interactions)")
+print(f"  {'Metric':<18} {'Model':>10} {'Gl Pop':>10} {'Cat Pop':>10} {'Co-occ':>10}")
+print(f"  {'-'*60}")
+print(f"  {'MRR':<18} {_m['mrr']:>10.4f} {_gp['mrr']:>10.4f} {_cp['mrr']:>10.4f} {nh_mrr:>10.4f}")
+for k in ks:
+    mk = {10:'r10',50:'r50',100:'r100',150:'r150',200:'r200'}[k]
+    nh_r = recall_nh[k] / max(count_nh, 1)
+    print(f"  {'Recall@'+str(k):<18} {_m[mk]:>10.4f} {_gp[mk]:>10.4f} {_cp[mk]:>10.4f} {nh_r:>10.4f}")
+
+print(f"\n  Repeat ({count_rep:,} interactions)")
+print(f"  {'Metric':<18} {'Model':>10} {'':>10} {'':>10} {'Co-occ':>10}")
+print(f"  {'-'*60}")
+print(f"  {'MRR':<18} {'0.5157':>10} {'':>10} {'':>10} {rep_mrr:>10.4f}")
+for k in ks:
+    rep_r = recall_rep[k] / max(count_rep, 1)
+    print(f"  {'Recall@'+str(k):<18} {'':>10} {'':>10} {'':>10} {rep_r:>10.4f}")
+
+print(f"\n  First-event: {count_nf:,} rows (co-occurrence undefined)")
+print(f"{'='*85}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Diagnostic: item-mean bypass vs user tower
+# ---------------------------------------------------------------------------
+# Diagnostic: bypass the user tower entirely.
+#
+# For each eval row with history, the query vector is the L2-normalized mean
+# of the item-tower embeddings of the recent products.  If this beats the
+# user tower, the MLP is the bottleneck.  If it is also weak, the item
+# embedding space itself is the problem (training signal, not architecture).
+#
+# Uses the 3-epoch traced item tower from MLflow (overall MRR 0.2044 vs
+# 2-epoch 0.2037 — close enough for a structural diagnostic).
+# ---------------------------------------------------------------------------
+import sys, os, importlib, pickle, time as _time
+import numpy as np
+import torch
+import torch.nn.functional as TF
+import pyarrow.parquet as pq
+import glob
+import mlflow
+import pandas as pd
+
+VOLUME_BASE = config.get("volume_base", "/Volumes/shared/mlc_schema/recommender_data")
+EVAL_PARQUET_PATH = f"{VOLUME_BASE}/session_eval"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- 1. Load traced item tower from MLflow ---
+RUN_ID = "cf71741f47cc4262a53ee7be8b713ba2"
+print(f"Loading traced item tower from run {RUN_ID[:8]}...")
+_art = mlflow.artifacts.download_artifacts(run_id=RUN_ID, artifact_path="item_tower/item_tower_traced.pt")
+item_tower = torch.jit.load(_art, map_location=device)
+item_tower.eval()
+
+# --- 2. Compute item embeddings for all 154K items ---
+print("Computing item embeddings...")
+if_df = pd.read_parquet(f"{VOLUME_BASE}/item_features")
+
+# Column order must match the traced model's positional args
+_long_cols = ["item_idx", "category_idx", "category_l2_idx", "category_l3_idx", "brand_idx"]
+_float_cols = ["item_log_price", "price_pct_rank", "price_pct_rank_l2",
+               "item_popularity", "item_conversion_rate",
+               "item_cart_to_purchase_rate", "item_recency_val"]
+
+with torch.no_grad():
+    args = [torch.tensor(if_df[c].values, dtype=torch.long, device=device) for c in _long_cols]
+    args += [torch.tensor(if_df[c].values, dtype=torch.float32, device=device) for c in _float_cols]
+    raw_embs = item_tower(*args)  # (N_items, embed_dim)
+    item_embs = TF.normalize(raw_embs, dim=1)  # L2 normalize for cosine sim
+
+# Build item_idx -> position mapping
+item_idx_arr = if_df["item_idx"].values
+max_idx = int(item_idx_arr.max())
+idx_to_pos = torch.full((max_idx + 1,), -1, dtype=torch.long, device=device)
+idx_to_pos[torch.tensor(item_idx_arr, device=device)] = torch.arange(len(item_idx_arr), device=device)
+
+print(f"  {len(if_df):,} items, embed_dim={item_embs.shape[1]}, device={device}")
+
+# --- 3. Eval loop: item-mean retrieval ---
+ks = [10, 50, 100, 150, 200]
+slices = ["novel_hist", "novel_first", "repeat"]
+mrr_acc = {s: 0.0 for s in slices}
+recall_acc = {s: {k: 0 for k in ks} for s in slices}
+count_acc = {s: 0 for s in slices}
+total = 0
+
+eval_files = sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet"))
+needed_cols = ["item_idx", "recent_product_ids", "recent_product_mask"]
+_t0 = _time.time()
+
+for fi, fpath in enumerate(eval_files):
+    for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed_cols):
+        item_idx = rb.column("item_idx").to_numpy(zero_copy_only=False)
+        rp = np.stack(rb.column("recent_product_ids").to_pandas().values)
+        rm = np.stack(rb.column("recent_product_mask").to_pandas().values)
+        B = len(item_idx)
+        total += B
+
+        # Classify
+        has_hist = rm.sum(axis=1) > 0
+        is_repeat = np.zeros(B, dtype=bool)
+        for j in range(rp.shape[1]):
+            is_repeat |= ((rp[:, j] == item_idx) & (rm[:, j] > 0))
+        is_novel = ~is_repeat
+        is_nh = is_novel & has_hist
+        is_nf = is_novel & ~has_hist
+
+        count_acc["novel_first"] += int(is_nf.sum())
+
+        # Process rows with history
+        hist_idx = np.where(has_hist)[0]
+        if len(hist_idx) == 0:
+            continue
+
+        _rp = torch.tensor(rp[hist_idx], dtype=torch.long, device=device)
+        _rm = torch.tensor(rm[hist_idx], dtype=torch.float32, device=device)
+        _ti_raw = torch.tensor(item_idx[hist_idx], dtype=torch.long, device=device)
+        B_h = len(hist_idx)
+
+        # Map item_idx -> embedding position (clamp unknowns to 0)
+        _rp_pos = idx_to_pos[_rp.clamp(0, max_idx)]
+        _rp_pos = _rp_pos.clamp(min=0)  # unknowns -> pos 0
+        _ti_pos = idx_to_pos[_ti_raw.clamp(0, max_idx)]
+        _ti_pos = _ti_pos.clamp(min=0)
+
+        # Gather recent product embeddings and mean-pool
+        recent_embs = item_embs[_rp_pos]               # (B_h, 10, D)
+        mask_3d = _rm.unsqueeze(-1)                     # (B_h, 10, 1)
+        pooled = (recent_embs * mask_3d).sum(dim=1)     # (B_h, D)
+        denom = _rm.sum(dim=1, keepdim=True).clamp(min=1)  # (B_h, 1)
+        query = TF.normalize(pooled / denom, dim=1)     # L2 normalize
+
+        # Cosine similarity with all items
+        scores = query @ item_embs.T                    # (B_h, N_items)
+
+        # Mask seen items for novel rows
+        _is_nh_h = torch.tensor(is_nh[hist_idx], dtype=torch.bool, device=device)
+        for j in range(_rp.shape[1]):
+            valid_j = (_rm[:, j] > 0) & _is_nh_h
+            rows_j = torch.where(valid_j)[0]
+            if len(rows_j) > 0:
+                cols_j = _rp_pos[rows_j, j]
+                scores[rows_j, cols_j] = -float("inf")
+
+        # Target scores and ranks
+        tgt_scores = scores[torch.arange(B_h, device=device), _ti_pos]
+        ranks = (scores > tgt_scores.unsqueeze(1)).sum(dim=1) + 1
+        rr = 1.0 / ranks.float()
+
+        # Accumulate novel-hist
+        mrr_acc["novel_hist"] += rr[_is_nh_h].sum().item()
+        count_acc["novel_hist"] += int(_is_nh_h.sum().item())
+        for k in ks:
+            recall_acc["novel_hist"][k] += int((ranks[_is_nh_h] <= k).sum().item())
+
+        # Accumulate repeat
+        _is_rep_h = torch.tensor(is_repeat[hist_idx], dtype=torch.bool, device=device)
+        mrr_acc["repeat"] += rr[_is_rep_h].sum().item()
+        count_acc["repeat"] += int(_is_rep_h.sum().item())
+        for k in ks:
+            recall_acc["repeat"][k] += int((ranks[_is_rep_h] <= k).sum().item())
+
+    if (fi + 1) % 5 == 0 or fi == len(eval_files) - 1:
+        print(f"  File {fi+1}/{len(eval_files)}, {total:,} rows ({_time.time()-_t0:.0f}s)")
+
+_elapsed = _time.time() - _t0
+print(f"\nTotal: {_elapsed:.0f}s ({_elapsed/60:.1f} min)")
+
+# --- 4. Print comparison ---
+nh_mrr = mrr_acc["novel_hist"] / max(count_acc["novel_hist"], 1)
+rep_mrr = mrr_acc["repeat"] / max(count_acc["repeat"], 1)
+
+# Known metrics
+_ut = {"mrr": 0.0777, "r10": 0.1773, "r50": 0.3212, "r100": 0.4050, "r150": 0.4533, "r200": 0.4879}
+_co = {"mrr": 0.1306, "r10": 0.2806, "r50": 0.5396, "r100": 0.6424, "r150": 0.6935, "r200": 0.7960}
+
+print(f"\n{'='*85}")
+print(f"  DIAGNOSTIC: item-mean bypass vs user tower vs co-occurrence")
+print(f"  (3-epoch model embeddings, no user tower MLP)")
+print(f"{'='*85}")
+
+print(f"\n  Has-history novel ({count_acc['novel_hist']:,} interactions)")
+print(f"  {'Metric':<18} {'User Tower':>12} {'Item Mean':>12} {'Co-occ':>10}")
+print(f"  {'-'*54}")
+print(f"  {'MRR':<18} {_ut['mrr']:>12.4f} {nh_mrr:>12.4f} {_co['mrr']:>10.4f}")
+for k in ks:
+    mk = {10:'r10',50:'r50',100:'r100',150:'r150',200:'r200'}[k]
+    nh_r = recall_acc["novel_hist"][k] / max(count_acc["novel_hist"], 1)
+    print(f"  {'Recall@'+str(k):<18} {_ut[mk]:>12.4f} {nh_r:>12.4f} {_co[mk]:>10.4f}")
+
+print(f"\n  Repeat ({count_acc['repeat']:,} interactions)")
+print(f"  {'MRR':<18} {'0.5157':>12} {rep_mrr:>12.4f}")
+
+print(f"\n  First-event: {count_acc['novel_first']:,} rows")
+print(f"  (Item mean = zero vector for first-event; co-occ also undefined)")
+print(f"{'='*85}")
+
+if nh_mrr > _ut["mrr"]:
+    print(f"\n  >>> Item-mean BEATS user tower ({nh_mrr:.4f} > {_ut['mrr']:.4f})")
+    print(f"  >>> User tower MLP is actively hurting — it adds noise.")
+else:
+    print(f"\n  >>> Item-mean LOSES to user tower ({nh_mrr:.4f} < {_ut['mrr']:.4f})")
+    print(f"  >>> Item embedding space is the problem, not the MLP.")
+
+if nh_mrr > _co["mrr"]:
+    print(f"  >>> Item-mean also beats co-occurrence — embedding space is strong.")
+else:
+    gap = _co["mrr"] - nh_mrr
+    print(f"  >>> Item-mean still behind co-occurrence by {gap:.4f} MRR.")
+    print(f"  >>> Embeddings don't encode 'viewed together' well enough.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Weight sweep: helpers + definitions
+# ---------------------------------------------------------------------------
+# Repeat-weight sweep with dual readout.
+#
+# For each weight w in {0, 0.2, 1.0}, trains from scratch with deterministic
+# seeding and evaluates both the user tower and the item-mean bypass on
+# masked has-history novel rows.  Item-mean measures embedding space quality
+# independent of the user tower; that is what the sweep is meant to improve.
+#
+# Repeat identification: item_idx in recent_product_ids where mask > 0.
+# Weighted loss: per_sample_loss * weight, divided by sum of weights.
+# ---------------------------------------------------------------------------
+import sys, os, importlib, time as _time, random, pickle
+import numpy as np
+import torch
+import torch.nn.functional as TF
+import pyarrow.parquet as pq
+import glob
+import pandas as pd
+from torch.utils.data import DataLoader
+
+VOLUME_BASE = config.get("volume_base", "/Volumes/shared/mlc_schema/recommender_data")
+TRAIN_PARQUET_PATH = f"{VOLUME_BASE}/session_train"
+EVAL_PARQUET_PATH  = f"{VOLUME_BASE}/session_eval"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def create_fresh_model():
+    """Instantiate a new model with the same architecture as cell 9."""
+    shared = SharedEmbeddings(
+        item_vocab_size=len(item_vocab) + 1,
+        brand_vocab_size=len(brand_vocab) + 1,
+        embed_dim=EMBED_DIM,
+    )
+    itow = ItemTower(
+        shared_emb=shared,
+        category_vocab_size=len(category_vocab) + 1,
+        category_l2_vocab_size=len(category_l2_vocab) + 1,
+        category_l3_vocab_size=len(category_l3_vocab) + 1,
+        embed_dim=EMBED_DIM,
+    )
+    utow = UserTower(shared_emb=shared, embed_dim=EMBED_DIM)
+    return TwoTowerModel(shared, itow, utow).to(device)
+
+
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def worker_init_fn(worker_id):
+    """Named function — lambdas fail under spawn start method."""
+    np.random.seed(torch.initial_seed() % (2**32))
+
+
+def train_batches(path, batch_size, seed, epoch):
+    """Direct Parquet batch generator — no DataLoader multiprocessing."""
+    files = sorted(glob.glob(f"{path}/*.parquet"))
+    random.Random(seed + epoch).shuffle(files)
+    all_cols = SCALAR_COLS + SEQ_COLS
+    for f in files:
+        for rb in pq.ParquetFile(f).iter_batches(batch_size, columns=all_cols):
+            batch = {}
+            for c in SCALAR_COLS:
+                batch[c] = torch.from_numpy(rb.column(c).to_numpy(zero_copy_only=False))
+            for c in SEQ_COLS:
+                batch[c] = torch.from_numpy(np.stack(rb.column(c).to_pandas().values))
+            yield batch
+
+
+def train_with_weight(model, repeat_weight, seed, num_epochs, mask_duplicates=False):
+    """Train model with per-sample loss weighting on repeat rows.
+    If mask_duplicates=True, mask logit entries where the same item_id
+    appears in multiple rows so duplicates aren't treated as negatives."""
+    seed_everything(seed)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    history = []
+    t0 = _time.time()
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        total_loss, n_batches = 0.0, 0
+        repeat_count, novel_count = 0, 0
+
+        for batch in train_batches(TRAIN_PARQUET_PATH, BATCH_SIZE, seed, epoch):
+            first_key = next(iter(batch))
+            if batch[first_key].shape[0] < BATCH_SIZE:
+                continue
+            user_batch, item_batch = parquet_batch_to_model_inputs(batch, device)
+
+            # Forward (get embeddings, not pre-reduced loss)
+            user_emb = model.user_tower(**user_batch)
+            item_emb = model.item_tower(**item_batch)
+            logits = user_emb @ item_emb.T / model.temperature
+
+            # Mask duplicate items: when the same product appears in
+            # multiple rows, those rows should not be negatives for each other
+            if mask_duplicates:
+                ids = item_batch["item_id"]
+                dup = (ids.unsqueeze(0) == ids.unsqueeze(1)) & ~torch.eye(
+                    len(ids), dtype=torch.bool, device=device
+                )
+                logits = logits.masked_fill(dup, float("-inf"))
+
+            labels = torch.arange(logits.size(0), device=device)
+
+            if repeat_weight == 1.0:
+                # Standard loss — no per-sample weighting needed
+                loss = TF.cross_entropy(logits, labels)
+            else:
+                # Per-sample loss with repeat weighting
+                per_sample = TF.cross_entropy(logits, labels, reduction="none")
+                rp = user_batch["recent_product_ids"]       # (B, 10)
+                rm = user_batch["recent_product_mask"]       # (B, 10)
+                ti = item_batch["item_id"]                   # (B,)
+                is_repeat = ((rp == ti.unsqueeze(1)) & (rm > 0)).any(dim=1)
+                weights = torch.where(is_repeat, repeat_weight, 1.0)
+                loss = (per_sample * weights).sum() / weights.sum()
+                repeat_count += int(is_repeat.sum().item())
+                novel_count  += int((~is_repeat).sum().item())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        history.append(avg_loss)
+        elapsed = _time.time() - t0
+        pct = repeat_count / max(repeat_count + novel_count, 1) * 100
+        print(f"  Epoch {epoch}/{num_epochs}: loss={avg_loss:.4f} "
+              f"({n_batches} batches, {elapsed:.0f}s"
+              f"{f', repeat={pct:.0f}%' if repeat_weight != 1.0 else ''})")
+
+    return history
+
+
+def item_mean_eval(model, device):
+    """Item-mean bypass: MRR + Recall on masked has-history novel rows.
+    Returns dict of metrics."""
+    from evaluation import load_evaluation_lookups, ITEM_EMB_COLUMNS
+
+    item_features, _, _ = load_evaluation_lookups(VOLUME_BASE)
+
+    # Build item embeddings from the model's item tower
+    _long = ["item_idx", "category_idx", "category_l2_idx", "category_l3_idx", "brand_idx"]
+    _float = ["item_log_price", "price_pct_rank", "price_pct_rank_l2",
+              "item_popularity", "item_conversion_rate",
+              "item_cart_to_purchase_rate", "item_recency_val"]
+    model.eval()
+    with torch.no_grad():
+        args = [torch.tensor(item_features[c].values, dtype=torch.long, device=device) for c in _long]
+        args += [torch.tensor(item_features[c].values, dtype=torch.float32, device=device) for c in _float]
+        item_embs = TF.normalize(model.item_tower(*args), dim=1)
+
+    # idx -> pos mapping
+    idx_arr = item_features["item_idx"].values
+    max_idx = int(idx_arr.max())
+    idx_to_pos = torch.full((max_idx + 1,), 0, dtype=torch.long, device=device)
+    idx_to_pos[torch.tensor(idx_arr, device=device)] = torch.arange(len(idx_arr), device=device)
+
+    ks = [10, 50, 100]
+    mrr_acc, recall_acc, count = 0.0, {k: 0 for k in ks}, 0
+    needed = ["item_idx", "recent_product_ids", "recent_product_mask"]
+
+    for fpath in sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet")):
+        for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed):
+            iidx = rb.column("item_idx").to_numpy(zero_copy_only=False)
+            rp = np.stack(rb.column("recent_product_ids").to_pandas().values)
+            rm = np.stack(rb.column("recent_product_mask").to_pandas().values)
+            B = len(iidx)
+            has_hist = rm.sum(axis=1) > 0
+            is_repeat = np.zeros(B, dtype=bool)
+            for j in range(rp.shape[1]):
+                is_repeat |= ((rp[:, j] == iidx) & (rm[:, j] > 0))
+            is_nh = (~is_repeat) & has_hist
+            nh_idx = np.where(is_nh)[0]
+            if len(nh_idx) == 0:
+                continue
+
+            _rp = torch.tensor(rp[nh_idx], dtype=torch.long, device=device)
+            _rm = torch.tensor(rm[nh_idx], dtype=torch.float32, device=device)
+            _ti = torch.tensor(iidx[nh_idx], dtype=torch.long, device=device)
+            Bh = len(nh_idx)
+
+            _rp_pos = idx_to_pos[_rp.clamp(0, max_idx)].clamp(min=0)
+            _ti_pos = idx_to_pos[_ti.clamp(0, max_idx)].clamp(min=0)
+
+            recent = item_embs[_rp_pos]
+            pooled = (recent * _rm.unsqueeze(-1)).sum(1) / _rm.sum(1, keepdim=True).clamp(min=1)
+            query = TF.normalize(pooled, dim=1)
+            scores = query @ item_embs.T
+
+            # Mask seen items
+            for j in range(_rp.shape[1]):
+                v = _rm[:, j] > 0
+                r = torch.where(v)[0]
+                if len(r) > 0:
+                    scores[r, _rp_pos[r, j]] = -float("inf")
+
+            tgt = scores[torch.arange(Bh, device=device), _ti_pos]
+            ranks = (scores > tgt.unsqueeze(1)).sum(1) + 1
+            mrr_acc += (1.0 / ranks.float()).sum().item()
+            count += Bh
+            for k in ks:
+                recall_acc[k] += int((ranks <= k).sum().item())
+
+    return {
+        "item_mean_mrr": mrr_acc / max(count, 1),
+        **{f"item_mean_r{k}": recall_acc[k] / max(count, 1) for k in ks},
+        "count": count,
+    }
+
+
+def user_tower_eval(model, device):
+    """Standard user-tower masked eval on has-history novel rows."""
+    from evaluation import (
+        load_evaluation_lookups, build_item_embedding_index,
+    )
+    item_features, train_counts, _ = load_evaluation_lookups(VOLUME_BASE)
+    model.eval()
+    item_embs, item_idx_list, _ = build_item_embedding_index(model, item_features, device)
+
+    # idx -> pos
+    max_idx = int(item_idx_list.max().item())
+    idx_to_pos = torch.full((max_idx + 1,), 0, dtype=torch.long, device=device)
+    idx_to_pos[item_idx_list] = torch.arange(len(item_idx_list), device=device)
+
+    ks = [10, 50, 100]
+    mrr_acc, recall_acc, count = 0.0, {k: 0 for k in ks}, 0
+    needed = list(set(SCALAR_COLS + SEQ_COLS))  # all model columns
+
+    for fpath in sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet")):
+        for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed):
+            batch = {}
+            for c in SCALAR_COLS:
+                batch[c] = torch.from_numpy(rb.column(c).to_numpy(zero_copy_only=False))
+            for c in SEQ_COLS:
+                batch[c] = torch.from_numpy(np.stack(rb.column(c).to_pandas().values))
+
+            user_batch, item_b = parquet_batch_to_model_inputs(batch, device)
+            iidx = rb.column("item_idx").to_numpy(zero_copy_only=False)
+            rp = np.stack(rb.column("recent_product_ids").to_pandas().values)
+            rm = np.stack(rb.column("recent_product_mask").to_pandas().values)
+            B = len(iidx)
+
+            has_hist = rm.sum(axis=1) > 0
+            is_repeat = np.zeros(B, dtype=bool)
+            for j in range(rp.shape[1]):
+                is_repeat |= ((rp[:, j] == iidx) & (rm[:, j] > 0))
+            is_nh = (~is_repeat) & has_hist
+            nh_idx = np.where(is_nh)[0]
+            if len(nh_idx) == 0:
+                continue
+
+            with torch.no_grad():
+                u_emb = model.user_tower(**user_batch)
+            u_nh = u_emb[nh_idx]
+            scores = u_nh @ item_embs.T
+            Bh = len(nh_idx)
+
+            _rp_t = torch.tensor(rp[nh_idx], dtype=torch.long, device=device)
+            _rm_t = torch.tensor(rm[nh_idx], dtype=torch.float32, device=device)
+            for j in range(_rp_t.shape[1]):
+                v = _rm_t[:, j] > 0
+                r = torch.where(v)[0]
+                if len(r) > 0:
+                    pos_j = idx_to_pos[_rp_t[r, j].clamp(0, max_idx)].clamp(min=0)
+                    scores[r, pos_j] = -float("inf")
+
+            _ti = torch.tensor(iidx[nh_idx], dtype=torch.long, device=device)
+            _ti_pos = idx_to_pos[_ti.clamp(0, max_idx)].clamp(min=0)
+            tgt = scores[torch.arange(Bh, device=device), _ti_pos]
+            ranks = (scores > tgt.unsqueeze(1)).sum(1) + 1
+            mrr_acc += (1.0 / ranks.float()).sum().item()
+            count += Bh
+            for k in ks:
+                recall_acc[k] += int((ranks <= k).sum().item())
+
+    return {
+        "user_tower_mrr": mrr_acc / max(count, 1),
+        **{f"user_tower_r{k}": recall_acc[k] / max(count, 1) for k in ks},
+        "count": count,
+    }
+
+
+SEED = 42
+sweep_results = {}  # populated by per-weight cells below
+print("Sweep helpers defined. Run the per-weight cells below.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Sweep: w=0.0 (drop repeat loss)
+# --- w=0.0: zero weight on repeat rows (novel-only signal) ---
+W = 0.0
+print(f"Training w={W}, seed={SEED}, {NUM_EPOCHS} epochs")
+mdl_0 = create_fresh_model()
+losses_0 = train_with_weight(mdl_0, repeat_weight=W, seed=SEED, num_epochs=NUM_EPOCHS)
+
+print("Evaluating item-mean readout...")
+im_0 = item_mean_eval(mdl_0, device)
+print(f"  Item-mean MRR={im_0['item_mean_mrr']:.4f}, R@10={im_0['item_mean_r10']:.4f}, R@100={im_0['item_mean_r100']:.4f}")
+
+print("Evaluating user-tower readout...")
+ut_0 = user_tower_eval(mdl_0, device)
+print(f"  User-tower MRR={ut_0['user_tower_mrr']:.4f}, R@10={ut_0['user_tower_r10']:.4f}, R@100={ut_0['user_tower_r100']:.4f}")
+
+sweep_results[W] = {"w": W, "losses": losses_0, **im_0, **ut_0}
+print(f"\nDone. Final loss: {losses_0[-1]:.4f}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Sweep: w=0.2 (downweight repeat loss)
+W = 0.2
+print(f"Training w={W}, seed={SEED}, {NUM_EPOCHS} epochs")
+mdl_02 = create_fresh_model()
+losses_02 = train_with_weight(mdl_02, repeat_weight=W, seed=SEED, num_epochs=NUM_EPOCHS)
+
+print("Evaluating item-mean readout...")
+im_02 = item_mean_eval(mdl_02, device)
+print(f"  Item-mean MRR={im_02['item_mean_mrr']:.4f}, R@10={im_02['item_mean_r10']:.4f}, R@100={im_02['item_mean_r100']:.4f}")
+
+print("Evaluating user-tower readout...")
+ut_02 = user_tower_eval(mdl_02, device)
+print(f"  User-tower MRR={ut_02['user_tower_mrr']:.4f}, R@10={ut_02['user_tower_r10']:.4f}, R@100={ut_02['user_tower_r100']:.4f}")
+
+sweep_results[W] = {"w": W, "losses": losses_02, **im_02, **ut_02}
+print(f"\nDone. Final loss: {losses_02[-1]:.4f}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Sweep: w=1.0 (baseline, standard loss)
+W = 1.0
+print(f"Training w={W}, seed={SEED}, {NUM_EPOCHS} epochs")
+mdl_10 = create_fresh_model()
+losses_10 = train_with_weight(mdl_10, repeat_weight=W, seed=SEED, num_epochs=NUM_EPOCHS)
+
+print("Evaluating item-mean readout...")
+im_10 = item_mean_eval(mdl_10, device)
+print(f"  Item-mean MRR={im_10['item_mean_mrr']:.4f}, R@10={im_10['item_mean_r10']:.4f}, R@100={im_10['item_mean_r100']:.4f}")
+
+print("Evaluating user-tower readout...")
+ut_10 = user_tower_eval(mdl_10, device)
+print(f"  User-tower MRR={ut_10['user_tower_mrr']:.4f}, R@10={ut_10['user_tower_r10']:.4f}, R@100={ut_10['user_tower_r100']:.4f}")
+
+sweep_results[W] = {"w": W, "losses": losses_10, **im_10, **ut_10}
+print(f"\nDone. Final loss: {losses_10[-1]:.4f}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Sweep summary table
+# ---------------------------------------------------------------------------
+# Sweep summary (hardcoded from cell outputs — kernel restarted between runs)
+# ---------------------------------------------------------------------------
+sweep_results = {
+    0.0: {"w": 0.0, "item_mean_mrr": 0.0867, "item_mean_r10": 0.1980, "item_mean_r100": 0.5441,
+          "user_tower_mrr": 0.0592, "user_tower_r10": 0.1309, "user_tower_r100": 0.4183, "losses": [5.7322, 5.3283]},
+    0.2: {"w": 0.2, "item_mean_mrr": 0.0978, "item_mean_r10": 0.2167, "item_mean_r100": 0.5549,
+          "user_tower_mrr": 0.0654, "user_tower_r10": 0.1436, "user_tower_r100": 0.4321, "losses": [5.4859, 5.0634]},
+    1.0: {"w": 1.0, "item_mean_mrr": 0.1062, "item_mean_r10": 0.2331, "item_mean_r100": 0.5719,
+          "user_tower_mrr": 0.0713, "user_tower_r10": 0.1564, "user_tower_r100": 0.4467, "losses": [4.6870, 4.2254]},
+}
+print(f"\n{'='*85}")
+print(f"  WEIGHT SWEEP RESULTS — has-history novel rows (masked)")
+print(f"  Co-occurrence baseline: MRR=0.1306, R@10=0.2806, R@100=0.6424")
+print(f"{'='*85}")
+print(f"\n  {'':>5}  {'--- Item Mean ---':>36}  {'--- User Tower ---':>36}")
+print(f"  {'w':>5}  {'MRR':>10} {'R@10':>10} {'R@100':>10}  {'MRR':>10} {'R@10':>10} {'R@100':>10}  {'Loss':>8}")
+print(f"  {'-'*84}")
+for w in [0.0, 0.2, 1.0]:
+    r = sweep_results[w]
+    print(f"  {w:>5.1f}  "
+          f"{r['item_mean_mrr']:>10.4f} {r['item_mean_r10']:>10.4f} {r['item_mean_r100']:>10.4f}  "
+          f"{r['user_tower_mrr']:>10.4f} {r['user_tower_r10']:>10.4f} {r['user_tower_r100']:>10.4f}  "
+          f"{r['losses'][-1]:>8.4f}")
+
+best = max(sweep_results.values(), key=lambda r: r["item_mean_mrr"])
+print(f"\n  Best item-mean MRR: w={best['w']} → {best['item_mean_mrr']:.4f}")
+cooc_gap = 0.1306 - best["item_mean_mrr"]
+if cooc_gap > 0:
+    print(f"  Gap to co-occurrence: {cooc_gap:.4f} MRR")
+else:
+    print(f"  Beats co-occurrence by {-cooc_gap:.4f} MRR!")
+print(f"{'='*85}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Experiment: batch duplicate masking (w=1.0)
+# ---------------------------------------------------------------------------
+# Train w=1.0 WITH batch duplicate masking and compare to w=1.0 without.
+# The mask prevents same-item rows in a batch from being treated as negatives.
+# ---------------------------------------------------------------------------
+SEED = 42
+print(f"Training w=1.0 + mask_duplicates, seed={SEED}, {NUM_EPOCHS} epochs")
+mdl_dup = create_fresh_model()
+losses_dup = train_with_weight(mdl_dup, repeat_weight=1.0, seed=SEED,
+                               num_epochs=NUM_EPOCHS, mask_duplicates=True)
+
+print("Evaluating item-mean readout...")
+im_dup = item_mean_eval(mdl_dup, device)
+print(f"  Item-mean MRR={im_dup['item_mean_mrr']:.4f}, "
+      f"R@10={im_dup['item_mean_r10']:.4f}, R@100={im_dup['item_mean_r100']:.4f}")
+
+print("Evaluating user-tower readout...")
+ut_dup = user_tower_eval(mdl_dup, device)
+print(f"  User-tower MRR={ut_dup['user_tower_mrr']:.4f}, "
+      f"R@10={ut_dup['user_tower_r10']:.4f}, R@100={ut_dup['user_tower_r100']:.4f}")
+
+# Comparison
+print(f"\n{'='*75}")
+print(f"  BATCH DUPLICATE MASKING — w=1.0, 2 epochs, seed=42")
+print(f"  Co-occurrence (tie-corrected): MRR=0.1277, R@10=0.2783")
+print(f"{'='*75}")
+print(f"  {'':>25} {'Item-Mean MRR':>15} {'Item-Mean R@10':>16} {'User-Tower MRR':>16}")
+print(f"  {'-'*75}")
+print(f"  {'w=1.0 (no mask)':>25} {'0.1062':>15} {'0.2331':>16} {'0.0713':>16}")
+print(f"  {'w=1.0 + dup mask':>25} {im_dup['item_mean_mrr']:>15.4f} "
+      f"{im_dup['item_mean_r10']:>16.4f} {ut_dup['user_tower_mrr']:>16.4f}")
+delta_im = im_dup['item_mean_mrr'] - 0.1062
+delta_ut = ut_dup['user_tower_mrr'] - 0.0713
+print(f"  {'Δ':>25} {delta_im:>+15.4f} {'':>16} {delta_ut:>+16.4f}")
+print(f"{'='*75}")
+
+# COMMAND ----------
+
+# DBTITLE 1,V3 residual towers + scalar stats
+# V3: residual towers + scalar standardization
+# ItemTowerV3:  normalize(item_emb(id) + MLP(metadata))  [zero-init last layer]
+# UserTowerV3:  normalize(prod_pool + MLP(scalars,brand)) [log1p+z-score, zero-init]
+
+# Training-set scalar stats (log1p-transformed, 25,102,502 rows)
+scalar_mean_t = torch.tensor([1.4167, 3.9993, 2.2012, 5.1946,
+                              0.3564, 1.3934, 0.0596, 0.0225],
+                             dtype=torch.float32)
+scalar_std_t = torch.tensor([1.0806, 2.3269, 2.2014, 3.0752,
+                             1.4083, 1.0752, 0.2533, 0.1405],
+                            dtype=torch.float32)
+
+class ItemTowerV3(nn.Module):
+    def __init__(self, shared, cat_sz, cat2_sz, cat3_sz, dim=64):
+        super().__init__()
+        self.shared = shared
+        self.cat = nn.Embedding(cat_sz, dim//2)
+        self.cat2 = nn.Embedding(cat2_sz, dim//4)
+        self.cat3 = nn.Embedding(cat3_sz, dim//4)
+        mlp_in = dim//2 + dim//4*2 + dim//2 + 7  # 103
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_in,256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(256,128), nn.ReLU(), nn.Linear(128,dim))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, item_id, category_id, category_l2_id, category_l3_id,
+                brand_id, log_price, price_pct_rank, price_pct_rank_l2,
+                item_popularity, item_conversion_rate,
+                item_cart_to_purchase_rate, item_recency):
+        e = self.shared.item_emb(item_id)
+        f = torch.cat([self.cat(category_id), self.cat2(category_l2_id),
+            self.cat3(category_l3_id), self.shared.brand_emb(brand_id),
+            log_price.unsqueeze(-1), price_pct_rank.unsqueeze(-1),
+            price_pct_rank_l2.unsqueeze(-1), item_popularity.unsqueeze(-1),
+            item_conversion_rate.unsqueeze(-1),
+            item_cart_to_purchase_rate.unsqueeze(-1),
+            item_recency.unsqueeze(-1)], -1)
+        return TF.normalize(e + self.mlp(f), p=2, dim=-1)
+
+class UserTowerV3(nn.Module):
+    def __init__(self, shared, dim=64, s_mean=None, s_std=None):
+        super().__init__()
+        self.shared = shared
+        self.register_buffer('s_mean', s_mean if s_mean is not None else torch.zeros(8))
+        self.register_buffer('s_std', s_std if s_std is not None else torch.ones(8))
+        self.mlp = nn.Sequential(
+            nn.Linear(12+dim//2, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128,64), nn.ReLU(), nn.Linear(64, dim))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, numeric, recent_product_ids, recent_product_mask,
+                recent_brand_ids, recent_brand_mask):
+        s = torch.log1p(numeric[:,:8].clamp(min=0))
+        s = (s - self.s_mean) / self.s_std.clamp(min=1e-6)
+        x = torch.cat([s, numeric[:,8:]], -1)
+        pp = masked_mean_pool(self.shared.item_emb(recent_product_ids),
+                              recent_product_mask)
+        bp = masked_mean_pool(self.shared.brand_emb(recent_brand_ids),
+                              recent_brand_mask)
+        return TF.normalize(pp + self.mlp(torch.cat([x, bp], -1)), p=2, dim=-1)
+
+def create_fresh_model_v3():
+    sh = SharedEmbeddings(len(item_vocab)+1, len(brand_vocab)+1, EMBED_DIM)
+    it = ItemTowerV3(sh, len(category_vocab)+1, len(category_l2_vocab)+1,
+                     len(category_l3_vocab)+1, EMBED_DIM)
+    ut = UserTowerV3(sh, EMBED_DIM, scalar_mean_t, scalar_std_t)
+    return TwoTowerModel(sh, it, ut).to(device)
+
+_v3 = create_fresh_model_v3()
+print(f"V3: {sum(p.numel() for p in _v3.parameters()):,} params")
+print(f"  ItemTowerV3: normalize(item_emb + MLP(metadata)), zero-init")
+print(f"  UserTowerV3: normalize(prod_pool + MLP(scalars+brand)), standardized")
+del _v3
+
+# COMMAND ----------
+
+# DBTITLE 1,Experiment: v3 residual + dup mask (w=1.0)
+# Train v3 (residual + standardized scalars) with duplicate masking.
+SEED = 42
+print(f"Training V3 + mask_duplicates, seed={SEED}, {NUM_EPOCHS} epochs")
+mdl_v3 = create_fresh_model_v3()
+losses_v3 = train_with_weight(mdl_v3, repeat_weight=1.0, seed=SEED,
+                              num_epochs=NUM_EPOCHS, mask_duplicates=True)
+
+print("\nEvaluating item-mean readout...")
+im_v3 = item_mean_eval(mdl_v3, device)
+print(f"  Item-mean MRR={im_v3['item_mean_mrr']:.4f}, "
+      f"R@10={im_v3['item_mean_r10']:.4f}, R@100={im_v3['item_mean_r100']:.4f}")
+
+print("Evaluating user-tower readout...")
+ut_v3 = user_tower_eval(mdl_v3, device)
+print(f"  User-tower MRR={ut_v3['user_tower_mrr']:.4f}, "
+      f"R@10={ut_v3['user_tower_r10']:.4f}, R@100={ut_v3['user_tower_r100']:.4f}")
+
+# Summary comparison
+print(f"\n{'='*80}")
+print(f"  V3 RESIDUAL + DUP MASK vs BASELINES")
+print(f"  Co-occurrence (corrected): MRR=0.1277, R@10=0.2783, R@100=0.6363")
+print(f"{'='*80}")
+print(f"  {'Config':>30} {'IM MRR':>10} {'IM R@10':>10} {'IM R@100':>10} "
+      f"{'UT MRR':>10} {'UT R@10':>10} {'UT R@100':>10}  {'Loss':>8}")
+print(f"  {'-'*98}")
+_rows = [
+    ("v2 baseline",     0.1062, 0.2331, 0.5719, 0.0713, 0.1564, 0.4467, 4.2254),
+    ("v2 + dup mask",   0.1034, 0.2276, 0.5575, 0.0748, 0.1648, 0.4585, 4.1432),
+]
+_rows.append((
+    "v3 + dup mask",
+    im_v3['item_mean_mrr'], im_v3['item_mean_r10'], im_v3['item_mean_r100'],
+    ut_v3['user_tower_mrr'], ut_v3['user_tower_r10'], ut_v3['user_tower_r100'],
+    losses_v3[-1],
+))
+for name, im_m, im_10, im_100, ut_m, ut_10, ut_100, loss in _rows:
+    print(f"  {name:>30} {im_m:>10.4f} {im_10:>10.4f} {im_100:>10.4f} "
+          f"{ut_m:>10.4f} {ut_10:>10.4f} {ut_100:>10.4f}  {loss:>8.4f}")
+_d_im = im_v3['item_mean_mrr'] - 0.1062
+_d_ut = ut_v3['user_tower_mrr'] - 0.0713
+_gap = im_v3['item_mean_mrr'] - ut_v3['user_tower_mrr']
+print(f"\n  vs v2 baseline:  item-mean {_d_im:+.4f}, user-tower {_d_ut:+.4f}")
+print(f"  MLP gap (IM-UT): {_gap:.4f}  (was 0.0349 in v2, 0.0286 with dup mask)")
+print(f"  Gap to co-occ:   {0.1277 - ut_v3['user_tower_mrr']:.4f}  (was 0.0564)")
+print(f"{'='*80}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Diagnose residual alignment (init + trained)
+# ---------------------------------------------------------------------------
+# Diagnostic: does the v3 residual actually align raw-ID and item-tower spaces?
+#
+# Check A: "correction off" — use only prod_pooled (raw ID mean) as query
+#          against item-tower embeddings. If this scores near item-mean (0.108),
+#          spaces are aligned and the MLP correction is what's hurting.
+#
+# Check B: cosine similarity between raw item_emb(id) and item-tower output
+#          for every product. If avg << 0.8, the MLP moves items far from
+#          their ID embeddings and the residual alignment hasn't held.
+#
+# Run on UNTRAINED model first (tests zero-init), then TRAINED model.
+# ---------------------------------------------------------------------------
+import time as _time
+from evaluation import load_evaluation_lookups, ITEM_EMB_COLUMNS
+
+def run_alignment_diagnostics(model, label, device):
+    """Run both checks on a model. Returns (correction_off_mrr, avg_cosine)."""
+    model.eval()
+    item_features, _, _ = load_evaluation_lookups(VOLUME_BASE)
+
+    # --- Build item-tower embeddings for all 154K items ---
+    _long = ["item_idx", "category_idx", "category_l2_idx", "category_l3_idx", "brand_idx"]
+    _float = ["item_log_price", "price_pct_rank", "price_pct_rank_l2",
+              "item_popularity", "item_conversion_rate",
+              "item_cart_to_purchase_rate", "item_recency_val"]
+    with torch.no_grad():
+        args = [torch.tensor(item_features[c].values, dtype=torch.long, device=device) for c in _long]
+        args += [torch.tensor(item_features[c].values, dtype=torch.float32, device=device) for c in _float]
+        item_tower_embs = model.item_tower(*args)       # already normalized
+        raw_id_embs = model.shared_emb.item_emb(args[0])  # raw ID lookup
+        raw_id_embs_n = TF.normalize(raw_id_embs, dim=1)
+
+    # --- Check B: cosine sim(raw_id, item_tower) per product ---
+    cosines = (raw_id_embs_n * item_tower_embs).sum(dim=1)
+    avg_cos = cosines.mean().item()
+    med_cos = cosines.median().item()
+    p10 = cosines.quantile(0.1).item()
+    p90 = cosines.quantile(0.9).item()
+    print(f"  Check B ({label}): cosine(raw_id, item_tower)")
+    print(f"    mean={avg_cos:.4f}  median={med_cos:.4f}  p10={p10:.4f}  p90={p90:.4f}")
+
+    # --- Check A: "correction off" eval (prod_pooled only as query) ---
+    idx_arr = item_features["item_idx"].values
+    max_idx = int(idx_arr.max())
+    idx_to_pos = torch.full((max_idx + 1,), 0, dtype=torch.long, device=device)
+    idx_to_pos[torch.tensor(idx_arr, device=device)] = torch.arange(len(idx_arr), device=device)
+
+    ks = [10, 100]
+    mrr_acc, recall_acc, count = 0.0, {k: 0 for k in ks}, 0
+    needed = ["item_idx", "recent_product_ids", "recent_product_mask"]
+
+    for fpath in sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet")):
+        for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed):
+            iidx = rb.column("item_idx").to_numpy(zero_copy_only=False)
+            rp = np.stack(rb.column("recent_product_ids").to_pandas().values)
+            rm = np.stack(rb.column("recent_product_mask").to_pandas().values)
+            B = len(iidx)
+            has_hist = rm.sum(axis=1) > 0
+            is_repeat = np.zeros(B, dtype=bool)
+            for j in range(rp.shape[1]):
+                is_repeat |= ((rp[:, j] == iidx) & (rm[:, j] > 0))
+            is_nh = (~is_repeat) & has_hist
+            nh_idx = np.where(is_nh)[0]
+            if len(nh_idx) == 0:
+                continue
+
+            _rp = torch.tensor(rp[nh_idx], dtype=torch.long, device=device)
+            _rm = torch.tensor(rm[nh_idx], dtype=torch.float32, device=device)
+            _ti = torch.tensor(iidx[nh_idx], dtype=torch.long, device=device)
+            Bh = len(nh_idx)
+
+            _rp_pos = idx_to_pos[_rp.clamp(0, max_idx)].clamp(min=0)
+            _ti_pos = idx_to_pos[_ti.clamp(0, max_idx)].clamp(min=0)
+
+            # Correction OFF: pool raw ID embeddings (not item-tower outputs)
+            with torch.no_grad():
+                recent_raw = raw_id_embs[_rp_pos]  # (Bh, 10, 64)
+                pooled = (recent_raw * _rm.unsqueeze(-1)).sum(1) / _rm.sum(1, keepdim=True).clamp(min=1)
+                query = TF.normalize(pooled, dim=1)
+                scores = query @ item_tower_embs.T
+
+            # Mask seen items
+            for j in range(_rp.shape[1]):
+                v = _rm[:, j] > 0
+                r = torch.where(v)[0]
+                if len(r) > 0:
+                    scores[r, _rp_pos[r, j]] = -float("inf")
+
+            tgt = scores[torch.arange(Bh, device=device), _ti_pos]
+            ranks = (scores > tgt.unsqueeze(1)).sum(1) + 1
+            mrr_acc += (1.0 / ranks.float()).sum().item()
+            count += Bh
+            for k in ks:
+                recall_acc[k] += int((ranks <= k).sum().item())
+
+    corr_off_mrr = mrr_acc / max(count, 1)
+    print(f"  Check A ({label}): correction-off (raw ID pool) MRR={corr_off_mrr:.4f}, "
+          f"R@10={recall_acc[10]/max(count,1):.4f}, R@100={recall_acc[100]/max(count,1):.4f}")
+    return corr_off_mrr, avg_cos
+
+# ---- Run on UNTRAINED v3 (tests zero-init alignment) ----
+print("=" * 70)
+print("  UNTRAINED V3 (zero-init, no training)")
+print("=" * 70)
+mdl_v3_init = create_fresh_model_v3()
+mrr_init, cos_init = run_alignment_diagnostics(mdl_v3_init, "untrained", device)
+del mdl_v3_init
+
+# ---- Retrain v3 and run on TRAINED model ----
+print(f"\n{'=' * 70}")
+print("  TRAINING V3 (seed=42, 2 epochs, dup mask)")
+print("=" * 70)
+mdl_v3 = create_fresh_model_v3()
+losses_v3 = train_with_weight(mdl_v3, repeat_weight=1.0, seed=42,
+                              num_epochs=NUM_EPOCHS, mask_duplicates=True)
+print()
+mrr_trained, cos_trained = run_alignment_diagnostics(mdl_v3, "trained", device)
+
+# ---- Summary ----
+print(f"\n{'=' * 70}")
+print(f"  RESIDUAL ALIGNMENT SUMMARY")
+print(f"{'=' * 70}")
+print(f"  {'':>20} {'Corr-off MRR':>14} {'Avg Cosine':>12}")
+print(f"  {'-' * 50}")
+print(f"  {'Untrained (init)':>20} {mrr_init:>14.4f} {cos_init:>12.4f}")
+print(f"  {'Trained (2 ep)':>20} {mrr_trained:>14.4f} {cos_trained:>12.4f}")
+print(f"  {'item-mean ref':>20} {'0.1082':>14} {'(n/a)':>12}")
+print(f"{'=' * 70}")
+if cos_trained < 0.8:
+    print(f"  WARNING: avg cosine {cos_trained:.4f} < 0.8 — item MLP moves")
+    print(f"  products far from their ID embeddings. Residual alignment broken.")
+if mrr_trained < 0.10:
+    print(f"  WARNING: correction-off MRR {mrr_trained:.4f} < item-mean 0.108.")
+    print(f"  Raw ID pool queries don't match item-tower space well.")
+
+# COMMAND ----------
+
+# DBTITLE 1,V4: user tower pools item-tower outputs
+# ---------------------------------------------------------------------------
+# V4: User tower pools ITEM-TOWER outputs (not raw ID embeddings).
+#
+# v3 diagnostic: raw-ID embeddings drift from item-tower output space after
+# training (avg cosine 0.54). Pooling raw IDs in the user tower queries a
+# different space than what the item tower produces for retrieval.
+#
+# Fix: run recent products through the actual item tower inside the user
+# tower forward pass, pool those outputs, add a zero-init correction.
+# This starts from exactly the item-mean query (0.108 MRR) and can only
+# improve. Uses v2 ItemTower (no residual — alignment with raw IDs is moot).
+#
+# Item features per product stored in a registered buffer for the forward
+# lookup. At serving, these would come from the embedding/feature table.
+# The latest training-period features are used; this matches serving where
+# the index holds the most recent features. Noted, not fixed.
+#
+# Gradients DO flow through the item tower for recent products (no detach).
+# First attempt used torch.no_grad() but item-mean dropped 0.106 → 0.093:
+# item_emb lost the gradient from the pooling path that taught it to arrange
+# items for effective mean-pooling. With grads, item_emb (and item tower MLP)
+# learn from both the candidate and the recent-product pooling path,
+# matching v2's dual gradient signal. Forward overhead ~35%; backward more
+# expensive (11x item tower) but total step overhead is measured below.
+# ---------------------------------------------------------------------------
+
+class UserTowerV4(nn.Module):
+    """User tower that pools item-tower outputs for recent products."""
+    FEAT_COLS = [
+        'category_idx', 'category_l2_idx', 'category_l3_idx', 'brand_idx',
+        'item_log_price', 'price_pct_rank', 'price_pct_rank_l2',
+        'item_popularity', 'item_conversion_rate',
+        'item_cart_to_purchase_rate', 'item_recency_val',
+    ]
+    N_LONG = 4   # first 4 columns are vocab indices
+    N_FEAT = 11
+
+    def __init__(self, shared_emb, dim=64, s_mean=None, s_std=None):
+        super().__init__()
+        self.shared = shared_emb
+        self._item_tower_ref = []  # list avoids nn.Module auto-registration
+        self.register_buffer('item_feat_buf', torch.zeros(1, self.N_FEAT))
+        self.register_buffer('s_mean',
+            s_mean if s_mean is not None else torch.zeros(8))
+        self.register_buffer('s_std',
+            s_std if s_std is not None else torch.ones(8))
+        # Correction MLP: scalars(12) + brand_pool(dim//2) -> dim
+        self.mlp = nn.Sequential(
+            nn.Linear(12 + dim // 2, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, dim))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def set_item_tower(self, item_tower):
+        self._item_tower_ref = [item_tower]
+
+    def set_item_features(self, item_features_df):
+        max_idx = int(item_features_df['item_idx'].max())
+        buf = torch.zeros(max_idx + 2, self.N_FEAT)
+        idx = item_features_df['item_idx'].values
+        for i, col in enumerate(self.FEAT_COLS):
+            buf[idx, i] = torch.tensor(
+                item_features_df[col].values, dtype=torch.float32)
+        self.item_feat_buf = buf
+
+    def forward(self, numeric, recent_product_ids, recent_product_mask,
+                recent_brand_ids, recent_brand_mask):
+        B, S = recent_product_ids.shape
+        item_tower = self._item_tower_ref[0]
+        flat_ids = recent_product_ids.reshape(-1)
+        feat = self.item_feat_buf[flat_ids]
+
+        # Gradients flow through: item_emb (and item tower MLP) get gradient
+        # from BOTH the candidate path and the recent-product pooling path.
+        # In v2, item_emb got this dual signal (candidate + user pooling);
+        # cutting it with no_grad dropped item-mean from 0.106 to 0.093.
+        recent_embs = item_tower(
+            item_id=flat_ids,
+            category_id=feat[:, 0].long(),
+            category_l2_id=feat[:, 1].long(),
+            category_l3_id=feat[:, 2].long(),
+            brand_id=feat[:, 3].long(),
+            log_price=feat[:, 4],
+            price_pct_rank=feat[:, 5],
+            price_pct_rank_l2=feat[:, 6],
+            item_popularity=feat[:, 7],
+            item_conversion_rate=feat[:, 8],
+            item_cart_to_purchase_rate=feat[:, 9],
+            item_recency=feat[:, 10],
+        )
+        recent_embs = recent_embs.reshape(B, S, -1)
+        prod_pooled = masked_mean_pool(recent_embs, recent_product_mask)
+
+        brand_emb = self.shared.brand_emb(recent_brand_ids)
+        brand_pooled = masked_mean_pool(brand_emb, recent_brand_mask)
+
+        s = torch.log1p(numeric[:, :8].clamp(min=0))
+        s = (s - self.s_mean) / self.s_std.clamp(min=1e-6)
+        x = torch.cat([s, numeric[:, 8:]], -1)
+
+        correction = self.mlp(torch.cat([x, brand_pooled], -1))
+        return TF.normalize(prod_pooled + correction, p=2, dim=-1)
+
+
+def create_fresh_model_v4():
+    sh = SharedEmbeddings(len(item_vocab)+1, len(brand_vocab)+1, EMBED_DIM)
+    it = ItemTower(sh, len(category_vocab)+1, len(category_l2_vocab)+1,
+                   len(category_l3_vocab)+1, EMBED_DIM)
+    ut = UserTowerV4(sh, EMBED_DIM, scalar_mean_t, scalar_std_t)
+    model = TwoTowerModel(sh, it, ut)
+    ut.set_item_tower(it)
+    _if = pd.read_parquet(f"{VOLUME_BASE}/item_features")
+    ut.set_item_features(_if)
+    return model.to(device)
+
+_v4 = create_fresh_model_v4()
+print(f"V4: {sum(p.numel() for p in _v4.parameters()):,} params")
+print(f"  ItemTower: v2 (concat+MLP)")
+print(f"  UserTowerV4: pools item-tower outputs, zero-init correction")
+print(f"  Item feat buffer: {_v4.user_tower.item_feat_buf.shape}")
+del _v4
+
+# COMMAND ----------
+
+# DBTITLE 1,Train V4 + evaluate (success check: UT ~= IM)
+# ---------------------------------------------------------------------------
+# Train V4 (user tower pools item-tower outputs) with dup mask, w=1.0.
+# Success check: user-tower MRR should reach ~0.108 (item-mean level).
+# If it falls short, the correction MLP or scalar standardization is off.
+# ---------------------------------------------------------------------------
+import time as _time
+
+SEED = 42
+print(f"Training V4 + mask_duplicates, seed={SEED}, {NUM_EPOCHS} epochs")
+mdl_v4 = create_fresh_model_v4()
+
+# Time first 100 batches (forward+backward) to measure overhead vs v2
+_t0 = _time.time()
+optimizer_t = torch.optim.AdamW(mdl_v4.parameters(), lr=1e-3, weight_decay=1e-5)
+mdl_v4.train()
+_n = 0
+for batch in train_batches(TRAIN_PARQUET_PATH, BATCH_SIZE, SEED, 0):
+    if batch[next(iter(batch))].shape[0] < BATCH_SIZE:
+        continue
+    user_batch, item_batch = parquet_batch_to_model_inputs(batch, device)
+    u = mdl_v4.user_tower(**user_batch)
+    i = mdl_v4.item_tower(**item_batch)
+    loss = TF.cross_entropy(u @ i.T / 0.05, torch.arange(len(u), device=device))
+    optimizer_t.zero_grad()
+    loss.backward()
+    optimizer_t.step()
+    _n += 1
+    if _n >= 100:
+        break
+_ms = (_time.time() - _t0) / _n * 1000
+print(f"  Full step timing: {_ms:.1f} ms/batch (100 batches, fwd+bwd+step)")
+del optimizer_t
+
+# Full training
+mdl_v4 = create_fresh_model_v4()  # fresh model
+losses_v4 = train_with_weight(mdl_v4, repeat_weight=1.0, seed=SEED,
+                              num_epochs=NUM_EPOCHS, mask_duplicates=True)
+
+print("\nEvaluating item-mean readout...")
+im_v4 = item_mean_eval(mdl_v4, device)
+print(f"  Item-mean MRR={im_v4['item_mean_mrr']:.4f}, "
+      f"R@10={im_v4['item_mean_r10']:.4f}, R@100={im_v4['item_mean_r100']:.4f}")
+
+print("Evaluating user-tower readout...")
+ut_v4 = user_tower_eval(mdl_v4, device)
+print(f"  User-tower MRR={ut_v4['user_tower_mrr']:.4f}, "
+      f"R@10={ut_v4['user_tower_r10']:.4f}, R@100={ut_v4['user_tower_r100']:.4f}")
+
+# Summary
+print(f"\n{'='*80}")
+print(f"  V4: USER TOWER POOLS ITEM-TOWER OUTPUTS")
+print(f"  Co-occurrence (corrected): MRR=0.1277, R@10=0.2783, R@100=0.6363")
+print(f"{'='*80}")
+print(f"  {'Config':>30} {'IM MRR':>10} {'IM R@10':>10} {'IM R@100':>10} "
+      f"{'UT MRR':>10} {'UT R@10':>10} {'UT R@100':>10}")
+print(f"  {'-'*90}")
+_rows = [
+    ("v2 baseline",   0.1062, 0.2331, 0.5719, 0.0713, 0.1564, 0.4467),
+    ("v2 + dup mask", 0.1034, 0.2276, 0.5575, 0.0748, 0.1648, 0.4585),
+    ("v3 + dup mask", 0.1082, 0.2371, 0.5692, 0.0750, 0.1642, 0.4457),
+]
+_rows.append((
+    "v4 + dup mask",
+    im_v4['item_mean_mrr'], im_v4['item_mean_r10'], im_v4['item_mean_r100'],
+    ut_v4['user_tower_mrr'], ut_v4['user_tower_r10'], ut_v4['user_tower_r100'],
+))
+for name, im_m, im_10, im_100, ut_m, ut_10, ut_100 in _rows:
+    print(f"  {name:>30} {im_m:>10.4f} {im_10:>10.4f} {im_100:>10.4f} "
+          f"{ut_m:>10.4f} {ut_10:>10.4f} {ut_100:>10.4f}")
+_gap = im_v4['item_mean_mrr'] - ut_v4['user_tower_mrr']
+print(f"\n  MLP gap (IM - UT): {_gap:.4f}  (was 0.0349 in v2)")
+if abs(_gap) < 0.005:
+    print(f"  SUCCESS: user tower matches item-mean within noise band.")
+else:
+    print(f"  WARNING: user tower still below item-mean by {_gap:.4f}.")
+    print(f"  Check zero-init and scalar standardization.")
+print(f"{'='*80}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Diagnostic: train vs eval gap + logQ
+# ---------------------------------------------------------------------------
+# Diagnostic: train-set vs eval-set gap  +  logQ correction
+#
+# Check 2: if UT > IM on training rows but < on eval → overfitting.
+#          if UT < IM on training rows too → biased objective.
+#          logQ should close the gap if the bias explanation is correct.
+#
+# logQ correction: subtract log(item_frequency) from logits before softmax.
+# This debiases in-batch negatives toward their true catalog share.
+# log_freq is computed from training-set item counts (already saved).
+#
+# Uses v2 architecture (not v4 — 40% overhead for no item-mean gain).
+# Tracks BOTH gaps: UT-to-IM and IM-to-co-occ.
+# ---------------------------------------------------------------------------
+import time as _time
+
+# --- Build log-frequency correction vector ---
+_tc = pd.read_parquet(f"{VOLUME_BASE}/train_item_counts")
+max_idx = int(_tc['item_idx'].max())
+log_freq = torch.zeros(max_idx + 1, device=device)
+log_freq[torch.tensor(_tc['item_idx'].values, device=device)] = \
+    torch.log(torch.tensor(_tc['count'].values, dtype=torch.float32, device=device))
+print(f"logQ built: {len(_tc)} items, max log_freq={log_freq.max():.2f}")
+
+def train_with_logq(model, seed, num_epochs, mask_duplicates=True):
+    """Train with logQ-corrected in-batch softmax."""
+    seed_everything(seed)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    hist = []
+    t0 = _time.time()
+    for ep in range(1, num_epochs + 1):
+        model.train()
+        tloss, nb = 0.0, 0
+        for batch in train_batches(TRAIN_PARQUET_PATH, BATCH_SIZE, seed, ep):
+            if batch[next(iter(batch))].shape[0] < BATCH_SIZE:
+                continue
+            ub, ib = parquet_batch_to_model_inputs(batch, device)
+            u = model.user_tower(**ub)
+            i = model.item_tower(**ib)
+            logits = u @ i.T / model.temperature
+            # logQ correction: subtract log(freq) for each column (negative)
+            ids = ib['item_id']
+            lq = log_freq[ids]                     # (B,)
+            logits = logits - lq.unsqueeze(0)       # broadcast: (B,B)
+            if mask_duplicates:
+                dup = (ids.unsqueeze(0) == ids.unsqueeze(1)) & \
+                      ~torch.eye(len(ids), dtype=torch.bool, device=device)
+                logits = logits.masked_fill(dup, float('-inf'))
+            labels = torch.arange(logits.size(0), device=device)
+            loss = TF.cross_entropy(logits, labels)
+            opt.zero_grad(); loss.backward(); opt.step()
+            tloss += loss.item(); nb += 1
+        avg = tloss / max(nb, 1)
+        hist.append(avg)
+        print(f"  Epoch {ep}/{num_epochs}: loss={avg:.4f} ({nb} batches, {_time.time()-t0:.0f}s)")
+    return hist
+
+def _eval_on_split(model, parquet_path, device, max_files=None):
+    """Item-mean + user-tower MRR on masked has-history novel rows for a given split."""
+    from evaluation import load_evaluation_lookups, build_item_embedding_index
+    item_features, _, _ = load_evaluation_lookups(VOLUME_BASE)
+    model.eval()
+    # item embeddings
+    _long = ['item_idx','category_idx','category_l2_idx','category_l3_idx','brand_idx']
+    _float = ['item_log_price','price_pct_rank','price_pct_rank_l2',
+              'item_popularity','item_conversion_rate','item_cart_to_purchase_rate','item_recency_val']
+    with torch.no_grad():
+        args = [torch.tensor(item_features[c].values, dtype=torch.long, device=device) for c in _long]
+        args += [torch.tensor(item_features[c].values, dtype=torch.float32, device=device) for c in _float]
+        ie = TF.normalize(model.item_tower(*args), dim=1)
+    ia = item_features['item_idx'].values
+    mx = int(ia.max())
+    i2p = torch.full((mx+1,), 0, dtype=torch.long, device=device)
+    i2p[torch.tensor(ia, device=device)] = torch.arange(len(ia), device=device)
+
+    im_mrr, ut_mrr, cnt = 0.0, 0.0, 0
+    needed_all = list(set(SCALAR_COLS + SEQ_COLS))
+    needed_im = ['item_idx','recent_product_ids','recent_product_mask']
+    files = sorted(glob.glob(f"{parquet_path}/*.parquet"))
+    if max_files:
+        files = files[:max_files]
+    for fpath in files:
+        for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed_all):
+            iidx = rb.column('item_idx').to_numpy(zero_copy_only=False)
+            rp = np.stack(rb.column('recent_product_ids').to_pandas().values)
+            rm = np.stack(rb.column('recent_product_mask').to_pandas().values)
+            B = len(iidx)
+            has_hist = rm.sum(axis=1) > 0
+            is_rep = np.zeros(B, dtype=bool)
+            for j in range(rp.shape[1]):
+                is_rep |= ((rp[:,j]==iidx) & (rm[:,j]>0))
+            nh = np.where((~is_rep)&has_hist)[0]
+            if len(nh)==0: continue
+
+            # -- item mean --
+            _rp = torch.tensor(rp[nh], dtype=torch.long, device=device)
+            _rm = torch.tensor(rm[nh], dtype=torch.float32, device=device)
+            _ti = torch.tensor(iidx[nh], dtype=torch.long, device=device)
+            Bh = len(nh)
+            _rp_pos = i2p[_rp.clamp(0,mx)].clamp(min=0)
+            _ti_pos = i2p[_ti.clamp(0,mx)].clamp(min=0)
+            rec = ie[_rp_pos]
+            q_im = TF.normalize((rec * _rm.unsqueeze(-1)).sum(1) / _rm.sum(1,keepdim=True).clamp(min=1), dim=1)
+            sc_im = q_im @ ie.T
+            for j in range(_rp.shape[1]):
+                v=_rm[:,j]>0; r=torch.where(v)[0]
+                if len(r)>0: sc_im[r, _rp_pos[r,j]] = -float('inf')
+            tgt_im = sc_im[torch.arange(Bh,device=device), _ti_pos]
+            im_mrr += (1.0/(((sc_im>tgt_im.unsqueeze(1)).sum(1)+1).float())).sum().item()
+
+            # -- user tower --
+            batch = {}
+            for c in SCALAR_COLS:
+                batch[c] = torch.from_numpy(rb.column(c).to_numpy(zero_copy_only=False))
+            for c in SEQ_COLS:
+                batch[c] = torch.from_numpy(np.stack(rb.column(c).to_pandas().values))
+            ub, _ = parquet_batch_to_model_inputs(batch, device)
+            with torch.no_grad():
+                ue = model.user_tower(**ub)
+            ue_nh = ue[nh]
+            sc_ut = ue_nh @ ie.T
+            for j in range(_rp.shape[1]):
+                v=_rm[:,j]>0; r=torch.where(v)[0]
+                if len(r)>0: sc_ut[r, _rp_pos[r,j]] = -float('inf')
+            tgt_ut = sc_ut[torch.arange(Bh,device=device), _ti_pos]
+            ut_mrr += (1.0/(((sc_ut>tgt_ut.unsqueeze(1)).sum(1)+1).float())).sum().item()
+            cnt += Bh
+    return im_mrr/max(cnt,1), ut_mrr/max(cnt,1), cnt
+
+# ===== STEP 1: Train v2 + dup mask (baseline) =====
+print('='*70)
+print('  STEP 1: v2 + dup mask baseline (for Check 2 diagnostic)')
+print('='*70)
+mdl_base = create_fresh_model()
+losses_base = train_with_weight(mdl_base, repeat_weight=1.0, seed=42,
+                                num_epochs=NUM_EPOCHS, mask_duplicates=True)
+
+# ===== STEP 2: Check 2 — train vs eval gap =====
+print(f"\n{'='*70}")
+print('  CHECK 2: train-set vs eval-set gap')
+print('  If UT > IM on train but < on eval → overfitting')
+print('  If UT < IM on train too → biased objective')
+print('='*70)
+print('Evaluating on TRAIN (first 8 files ~3M rows)...')
+im_train, ut_train, cnt_train = _eval_on_split(mdl_base, TRAIN_PARQUET_PATH, device, max_files=8)
+print(f'  Train: IM={im_train:.4f}  UT={ut_train:.4f}  gap={im_train-ut_train:.4f}  ({cnt_train:,} rows)')
+print('Evaluating on EVAL (full)...')
+im_eval, ut_eval, cnt_eval = _eval_on_split(mdl_base, EVAL_PARQUET_PATH, device)
+print(f'  Eval:  IM={im_eval:.4f}  UT={ut_eval:.4f}  gap={im_eval-ut_eval:.4f}  ({cnt_eval:,} rows)')
+
+if ut_train > im_train and ut_eval < im_eval:
+    print('  \u2192 Overfitting: UT beats IM on train, loses on eval.')
+elif ut_train < im_train:
+    print('  \u2192 Biased objective: UT < IM even on training data.')
+    print('    logQ should close this gap.')
+else:
+    print('  \u2192 Mixed signal.')
+del mdl_base
+
+# ===== STEP 3: Train v2 + dup mask + logQ =====
+print(f"\n{'='*70}")
+print('  STEP 3: v2 + dup mask + logQ correction')
+print('='*70)
+mdl_logq = create_fresh_model()
+losses_logq = train_with_logq(mdl_logq, seed=42, num_epochs=NUM_EPOCHS,
+                              mask_duplicates=True)
+
+print('\nEvaluating item-mean...')
+im_lq = item_mean_eval(mdl_logq, device)
+print(f"  IM MRR={im_lq['item_mean_mrr']:.4f}, R@10={im_lq['item_mean_r10']:.4f}, "
+      f"R@100={im_lq['item_mean_r100']:.4f}")
+print('Evaluating user-tower...')
+ut_lq = user_tower_eval(mdl_logq, device)
+print(f"  UT MRR={ut_lq['user_tower_mrr']:.4f}, R@10={ut_lq['user_tower_r10']:.4f}, "
+      f"R@100={ut_lq['user_tower_r100']:.4f}")
+
+# ===== SUMMARY =====
+print(f"\n{'='*80}")
+print(f"  logQ CORRECTION RESULTS")
+print(f"  Co-occurrence: MRR=0.1277, R@10=0.2783")
+print(f"{'='*80}")
+print(f"  {'Config':>30} {'IM MRR':>10} {'UT MRR':>10} {'MLP gap':>10} {'IM→cooc':>10}")
+print(f"  {'-'*72}")
+_r = [
+    ('v2 + dup mask (prev)',  0.1034, 0.0748, 0.0286, 0.0243),
+    ('v2 + dup mask (rerun)', im_eval, ut_eval, im_eval-ut_eval, 0.1277-im_eval),
+    ('v2 + dup + logQ',      im_lq['item_mean_mrr'], ut_lq['user_tower_mrr'],
+     im_lq['item_mean_mrr']-ut_lq['user_tower_mrr'],
+     0.1277-im_lq['item_mean_mrr']),
+]
+for n, im, ut, g1, g2 in _r:
+    print(f"  {n:>30} {im:>10.4f} {ut:>10.4f} {g1:>+10.4f} {g2:>10.4f}")
+_d_mlp = (im_lq['item_mean_mrr']-ut_lq['user_tower_mrr']) - (im_eval-ut_eval)
+_d_im = im_lq['item_mean_mrr'] - im_eval
+print(f"\n  logQ effect on MLP gap: {_d_mlp:+.4f}  (negative = gap closed)")
+print(f"  logQ effect on item-mean: {_d_im:+.4f}  (positive = better embeddings)")
+print(f"{'='*80}")
+
+# COMMAND ----------
+
+# DBTITLE 1,logQ: verification checks + second seed
+# ---------------------------------------------------------------------------
+# logQ verification: all slices, over-correction check, second seed.
+#
+# Confirmed:
+#   - Eval uses plain dot product (no logQ in scores)
+#   - train_item_counts built from training parquet only
+#
+# This cell:
+#   1. Train v2+dup+logQ seed=42 and seed=123
+#   2. Full-slice eval: has-history novel, repeat, first-event
+#   3. Over-correction check: median popularity of top-10 recs
+# ---------------------------------------------------------------------------
+import time as _time
+
+# --- Build log-frequency correction vector ---
+_tc = pd.read_parquet(f"{VOLUME_BASE}/train_item_counts")
+max_idx = int(_tc['item_idx'].max())
+log_freq = torch.zeros(max_idx + 1, device=device)
+log_freq[torch.tensor(_tc['item_idx'].values, device=device)] = \
+    torch.log(torch.tensor(_tc['count'].values, dtype=torch.float32, device=device))
+
+# Item count lookup for popularity check
+item_count = torch.zeros(max_idx + 1, device=device)
+item_count[torch.tensor(_tc['item_idx'].values, device=device)] = \
+    torch.tensor(_tc['count'].values, dtype=torch.float32, device=device)
+
+def train_with_logq(model, seed, num_epochs, mask_duplicates=True):
+    seed_everything(seed)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    hist = []
+    t0 = _time.time()
+    for ep in range(1, num_epochs + 1):
+        model.train()
+        tloss, nb = 0.0, 0
+        for batch in train_batches(TRAIN_PARQUET_PATH, BATCH_SIZE, seed, ep):
+            if batch[next(iter(batch))].shape[0] < BATCH_SIZE:
+                continue
+            ub, ib = parquet_batch_to_model_inputs(batch, device)
+            u = model.user_tower(**ub)
+            i = model.item_tower(**ib)
+            logits = u @ i.T / model.temperature
+            ids = ib['item_id']
+            logits = logits - log_freq[ids].unsqueeze(0)
+            if mask_duplicates:
+                dup = (ids.unsqueeze(0) == ids.unsqueeze(1)) & \
+                      ~torch.eye(len(ids), dtype=torch.bool, device=device)
+                logits = logits.masked_fill(dup, float('-inf'))
+            loss = TF.cross_entropy(logits, torch.arange(logits.size(0), device=device))
+            opt.zero_grad(); loss.backward(); opt.step()
+            tloss += loss.item(); nb += 1
+        avg = tloss / max(nb, 1)
+        hist.append(avg)
+        print(f"  Epoch {ep}/{num_epochs}: loss={avg:.4f} ({nb} batches, {_time.time()-t0:.0f}s)")
+    return hist
+
+def full_slice_eval(model, device, label, check_popularity=False):
+    """Eval on all three slices: has-history novel, repeat, first-event.
+    Optionally check median training popularity of top-10 recs."""
+    from evaluation import load_evaluation_lookups
+    item_features, _, _ = load_evaluation_lookups(VOLUME_BASE)
+    model.eval()
+    _long = ['item_idx','category_idx','category_l2_idx','category_l3_idx','brand_idx']
+    _float = ['item_log_price','price_pct_rank','price_pct_rank_l2',
+              'item_popularity','item_conversion_rate','item_cart_to_purchase_rate','item_recency_val']
+    with torch.no_grad():
+        args = [torch.tensor(item_features[c].values, dtype=torch.long, device=device) for c in _long]
+        args += [torch.tensor(item_features[c].values, dtype=torch.float32, device=device) for c in _float]
+        ie = TF.normalize(model.item_tower(*args), dim=1)
+    ia = item_features['item_idx'].values
+    mx = int(ia.max())
+    i2p = torch.full((mx+1,), 0, dtype=torch.long, device=device)
+    i2p[torch.tensor(ia, device=device)] = torch.arange(len(ia), device=device)
+    # item_idx per position for popularity lookup
+    pos_to_idx = torch.tensor(ia, dtype=torch.long, device=device)
+
+    ks = [10, 100]
+    slices = ['novel_hist', 'repeat', 'first_event']
+    mrr = {s: 0.0 for s in slices}
+    recall = {s: {k: 0 for k in ks} for s in slices}
+    cnt = {s: 0 for s in slices}
+    pop_recs_ut = []  # median pop of UT top-10 recs (novel_hist only)
+    pop_recs_im = []  # median pop of IM top-10 recs
+
+    needed = list(set(SCALAR_COLS + SEQ_COLS))
+    for fpath in sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet")):
+        for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed):
+            iidx = rb.column('item_idx').to_numpy(zero_copy_only=False)
+            rp = np.stack(rb.column('recent_product_ids').to_pandas().values)
+            rm = np.stack(rb.column('recent_product_mask').to_pandas().values)
+            B = len(iidx)
+            has_hist = rm.sum(axis=1) > 0
+            is_rep = np.zeros(B, dtype=bool)
+            for j in range(rp.shape[1]):
+                is_rep |= ((rp[:,j]==iidx) & (rm[:,j]>0))
+            is_nh = (~is_rep) & has_hist
+            is_nf = (~is_rep) & (~has_hist)
+
+            batch = {}
+            for c in SCALAR_COLS:
+                batch[c] = torch.from_numpy(rb.column(c).to_numpy(zero_copy_only=False))
+            for c in SEQ_COLS:
+                batch[c] = torch.from_numpy(np.stack(rb.column(c).to_pandas().values))
+            ub, _ = parquet_batch_to_model_inputs(batch, device)
+
+            with torch.no_grad():
+                ue = model.user_tower(**ub)
+
+            for sl, mask_np in [('novel_hist', is_nh), ('repeat', is_rep), ('first_event', is_nf)]:
+                idx = np.where(mask_np)[0]
+                if len(idx) == 0:
+                    continue
+                _ti = torch.tensor(iidx[idx], dtype=torch.long, device=device)
+                _ti_pos = i2p[_ti.clamp(0,mx)].clamp(min=0)
+                sc = ue[idx] @ ie.T
+                Bh = len(idx)
+
+                # Mask seen items for novel slices
+                if sl in ('novel_hist',):
+                    _rp = torch.tensor(rp[idx], dtype=torch.long, device=device)
+                    _rm = torch.tensor(rm[idx], dtype=torch.float32, device=device)
+                    for j in range(_rp.shape[1]):
+                        v = _rm[:,j] > 0
+                        r = torch.where(v)[0]
+                        if len(r) > 0:
+                            sc[r, i2p[_rp[r,j].clamp(0,mx)].clamp(min=0)] = -float('inf')
+
+                tgt = sc[torch.arange(Bh, device=device), _ti_pos]
+                ranks = (sc > tgt.unsqueeze(1)).sum(1) + 1
+                mrr[sl] += (1.0 / ranks.float()).sum().item()
+                cnt[sl] += Bh
+                for k in ks:
+                    recall[sl][k] += int((ranks <= k).sum().item())
+
+                # Popularity of top-10 recs (novel_hist, user tower)
+                if sl == 'novel_hist' and check_popularity:
+                    top10 = sc.topk(10, dim=1).indices  # (Bh, 10)
+                    top10_idx = pos_to_idx[top10]  # item_idx values
+                    top10_pop = item_count[top10_idx]  # training counts
+                    pop_recs_ut.append(top10_pop.median(dim=1).values)
+
+    # Item-mean eval for novel_hist (for popularity comparison)
+    im_mrr, im_r10, im_r100 = 0.0, 0, 0
+    im_cnt = 0
+    for fpath in sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet")):
+        for rb in pq.ParquetFile(fpath).iter_batches(2048,
+                columns=['item_idx','recent_product_ids','recent_product_mask']):
+            iidx = rb.column('item_idx').to_numpy(zero_copy_only=False)
+            rp = np.stack(rb.column('recent_product_ids').to_pandas().values)
+            rm = np.stack(rb.column('recent_product_mask').to_pandas().values)
+            B = len(iidx)
+            has_hist = rm.sum(axis=1) > 0
+            is_rep = np.zeros(B, dtype=bool)
+            for j in range(rp.shape[1]):
+                is_rep |= ((rp[:,j]==iidx) & (rm[:,j]>0))
+            nh = np.where((~is_rep) & has_hist)[0]
+            if len(nh)==0: continue
+            _rp = torch.tensor(rp[nh], dtype=torch.long, device=device)
+            _rm = torch.tensor(rm[nh], dtype=torch.float32, device=device)
+            _ti = torch.tensor(iidx[nh], dtype=torch.long, device=device)
+            _rp_pos = i2p[_rp.clamp(0,mx)].clamp(min=0)
+            _ti_pos = i2p[_ti.clamp(0,mx)].clamp(min=0)
+            rec = ie[_rp_pos]
+            q = TF.normalize((rec*_rm.unsqueeze(-1)).sum(1)/_rm.sum(1,keepdim=True).clamp(min=1), dim=1)
+            sc = q @ ie.T
+            for j in range(_rp.shape[1]):
+                v=_rm[:,j]>0; r=torch.where(v)[0]
+                if len(r)>0: sc[r, _rp_pos[r,j]] = -float('inf')
+            tgt = sc[torch.arange(len(nh),device=device), _ti_pos]
+            ranks = (sc>tgt.unsqueeze(1)).sum(1)+1
+            im_mrr += (1.0/ranks.float()).sum().item()
+            im_cnt += len(nh)
+            im_r10 += int((ranks<=10).sum().item())
+            im_r100 += int((ranks<=100).sum().item())
+            if check_popularity:
+                top10 = sc.topk(10,dim=1).indices
+                top10_idx = pos_to_idx[top10]
+                pop_recs_im.append(item_count[top10_idx].median(dim=1).values)
+
+    results = {
+        'label': label,
+        'slices': {s: {
+            'mrr': mrr[s]/max(cnt[s],1),
+            **{f'r{k}': recall[s][k]/max(cnt[s],1) for k in ks},
+            'count': cnt[s],
+        } for s in slices},
+        'im': {'mrr': im_mrr/max(im_cnt,1), 'r10': im_r10/max(im_cnt,1),
+               'r100': im_r100/max(im_cnt,1), 'count': im_cnt},
+    }
+    if check_popularity and pop_recs_ut:
+        results['pop_ut_median'] = torch.cat(pop_recs_ut).median().item()
+        results['pop_ut_mean'] = torch.cat(pop_recs_ut).mean().item()
+        results['pop_im_median'] = torch.cat(pop_recs_im).median().item()
+        results['pop_im_mean'] = torch.cat(pop_recs_im).mean().item()
+    return results
+
+# ===== Train and eval both seeds =====
+all_results = []
+for seed in [42, 123]:
+    print(f"\n{'='*70}")
+    print(f"  TRAINING v2 + dup + logQ, seed={seed}")
+    print(f"{'='*70}")
+    mdl = create_fresh_model()
+    losses = train_with_logq(mdl, seed=seed, num_epochs=NUM_EPOCHS)
+    r = full_slice_eval(mdl, device, f"logQ seed={seed}", check_popularity=(seed==42))
+    r['losses'] = losses
+    all_results.append(r)
+    nh = r['slices']['novel_hist']
+    rep = r['slices']['repeat']
+    fe = r['slices']['first_event']
+    im = r['im']
+    print(f"\n  Novel-hist ({nh['count']:,}): UT MRR={nh['mrr']:.4f} R@10={nh['r10']:.4f} R@100={nh['r100']:.4f}")
+    print(f"  Item-mean  ({im['count']:,}): IM MRR={im['mrr']:.4f} R@10={im['r10']:.4f} R@100={im['r100']:.4f}")
+    print(f"  Repeat     ({rep['count']:,}): UT MRR={rep['mrr']:.4f} R@10={rep['r10']:.4f} R@100={rep['r100']:.4f}")
+    print(f"  First-event({fe['count']:,}): UT MRR={fe['mrr']:.4f} R@10={fe['r10']:.4f} R@100={fe['r100']:.4f}")
+    if seed == 42:
+        del mdl  # keep last model
+    else:
+        mdl_logq_s2 = mdl  # keep seed=123 model
+
+# ===== Also train no-logQ baseline seed=42 for popularity comparison =====
+print(f"\n{'='*70}")
+print(f"  BASELINE: v2 + dup (no logQ), seed=42")
+print(f"{'='*70}")
+mdl_noq = create_fresh_model()
+losses_noq = train_with_weight(mdl_noq, repeat_weight=1.0, seed=42,
+                               num_epochs=NUM_EPOCHS, mask_duplicates=True)
+r_noq = full_slice_eval(mdl_noq, device, 'no-logQ seed=42', check_popularity=True)
+nh_noq = r_noq['slices']['novel_hist']
+rep_noq = r_noq['slices']['repeat']
+fe_noq = r_noq['slices']['first_event']
+im_noq = r_noq['im']
+print(f"  Novel-hist: UT MRR={nh_noq['mrr']:.4f} R@10={nh_noq['r10']:.4f} R@100={nh_noq['r100']:.4f}")
+print(f"  Item-mean:  IM MRR={im_noq['mrr']:.4f} R@10={im_noq['r10']:.4f} R@100={im_noq['r100']:.4f}")
+print(f"  Repeat:     UT MRR={rep_noq['mrr']:.4f} R@10={rep_noq['r10']:.4f} R@100={rep_noq['r100']:.4f}")
+print(f"  First-event:UT MRR={fe_noq['mrr']:.4f} R@10={fe_noq['r10']:.4f} R@100={fe_noq['r100']:.4f}")
+del mdl_noq
+
+# ===== COMPREHENSIVE SUMMARY =====
+print(f"\n{'='*90}")
+print(f"  COMPREHENSIVE logQ VERIFICATION")
+print(f"  Co-occurrence (corrected): MRR=0.1277, R@10=0.2783, R@100=0.6363")
+print(f"  Category popularity:       MRR=0.0313, R@10=0.0660")
+print(f"{'='*90}")
+
+print(f"\n  HAS-HISTORY NOVEL (masked):")
+print(f"  {'Config':>25} {'UT MRR':>10} {'UT R@10':>10} {'UT R@100':>10} "
+      f"{'IM MRR':>10} {'IM R@10':>10} {'IM R@100':>10}")
+print(f"  {'-'*85}")
+for r in [r_noq] + all_results:
+    nh, im = r['slices']['novel_hist'], r['im']
+    print(f"  {r['label']:>25} {nh['mrr']:>10.4f} {nh['r10']:>10.4f} {nh['r100']:>10.4f} "
+          f"{im['mrr']:>10.4f} {im['r10']:>10.4f} {im['r100']:>10.4f}")
+
+print(f"\n  REPEAT:")
+print(f"  {'Config':>25} {'MRR':>10} {'R@10':>10} {'R@100':>10} {'Count':>10}")
+print(f"  {'-'*55}")
+for r in [r_noq] + all_results:
+    rep = r['slices']['repeat']
+    print(f"  {r['label']:>25} {rep['mrr']:>10.4f} {rep['r10']:>10.4f} {rep['r100']:>10.4f} {rep['count']:>10,}")
+
+print(f"\n  FIRST-EVENT (no history):")
+print(f"  {'Config':>25} {'MRR':>10} {'R@10':>10} {'R@100':>10} {'Count':>10}")
+print(f"  {'-'*55}")
+for r in [r_noq] + all_results:
+    fe = r['slices']['first_event']
+    print(f"  {r['label']:>25} {fe['mrr']:>10.4f} {fe['r10']:>10.4f} {fe['r100']:>10.4f} {fe['count']:>10,}")
+
+# Popularity check
+print(f"\n  OVER-CORRECTION CHECK (median training count of top-10 recs):")
+print(f"  {'':>25} {'UT Median':>12} {'UT Mean':>12} {'IM Median':>12} {'IM Mean':>12}")
+print(f"  {'-'*65}")
+for r in [r_noq] + all_results[:1]:  # seed=42 only
+    if 'pop_ut_median' in r:
+        print(f"  {r['label']:>25} {r['pop_ut_median']:>12.0f} {r['pop_ut_mean']:>12.0f} "
+              f"{r['pop_im_median']:>12.0f} {r['pop_im_mean']:>12.0f}")
+
+# Seed consistency
+if len(all_results) == 2:
+    s1, s2 = all_results[0]['slices']['novel_hist'], all_results[1]['slices']['novel_hist']
+    print(f"\n  SEED CONSISTENCY (novel-hist UT MRR):")
+    print(f"    seed=42:  {s1['mrr']:.4f}")
+    print(f"    seed=123: {s2['mrr']:.4f}")
+    print(f"    delta:    {abs(s1['mrr']-s2['mrr']):.4f}  (noise band: 0.002-0.006)")
+print(f"{'='*90}")
+
+# COMMAND ----------
+
+# DBTITLE 1,RRF blend: logQ model + co-occurrence
+# ---------------------------------------------------------------------------
+# RRF blend: logQ model + co-occurrence
+#
+# Reciprocal Rank Fusion: rrf_j = 1/(60 + rank_model_j) + w/(60 + rank_cooc_j)
+# Tune w on the Nov 1-3 eval slice. First-event rows use model alone.
+# Bar for adoption: ≥0.005 MRR improvement on has-history novel.
+#
+# Uses ranks, not raw scores — co-occ scores are unbounded integer sums,
+# model scores are cosines, so a weighted sum of raw scores is fragile.
+# ---------------------------------------------------------------------------
+import pickle, time as _time
+
+K_RRF = 60  # standard RRF constant
+
+# --- Use logQ model from kernel ---
+try:
+    _blend_model = mdl_logq_s2
+    print("Using logQ seed=123 model from kernel")
+except NameError:
+    print("Retraining logQ seed=42 model...")
+    _blend_model = create_fresh_model()
+    train_with_logq(_blend_model, seed=42, num_epochs=NUM_EPOCHS)
+_blend_model.eval()
+
+# --- Compute item embeddings ---
+from evaluation import load_evaluation_lookups
+_if, _, _ = load_evaluation_lookups(VOLUME_BASE)
+_long_cols = ['item_idx','category_idx','category_l2_idx','category_l3_idx','brand_idx']
+_float_cols = ['item_log_price','price_pct_rank','price_pct_rank_l2',
+               'item_popularity','item_conversion_rate','item_cart_to_purchase_rate','item_recency_val']
+with torch.no_grad():
+    _al = [torch.tensor(_if[c].values, dtype=torch.long, device=device) for c in _long_cols]
+    _af = [torch.tensor(_if[c].values, dtype=torch.float32, device=device) for c in _float_cols]
+    _item_embs = TF.normalize(_blend_model.item_tower(*_al, *_af), dim=1)
+
+_ia = _if['item_idx'].values
+_mx = int(_ia.max())
+N_items = len(_ia)
+_i2p = torch.full((_mx+1,), 0, dtype=torch.long, device=device)
+_i2p[torch.tensor(_ia, device=device)] = torch.arange(N_items, device=device)
+print(f"Item embeddings: {N_items:,} items, dim={_item_embs.shape[1]}")
+
+# --- Build co-occ top-K neighbor index on GPU ---
+print(f"Loading co-occurrence matrix...")
+with open(f"{VOLUME_BASE}/cooc_matrix.pkl", "rb") as f:
+    _cooc_cpu = pickle.load(f)
+_cooc_sz = _cooc_cpu.shape[0]
+
+TOP_K = 150
+print(f"Building top-{TOP_K} neighbor index from {_cooc_cpu.nnz:,} nnz...")
+_t0 = _time.time()
+_nb = np.zeros((_cooc_sz, TOP_K), dtype=np.int64)
+_sc = np.zeros((_cooc_sz, TOP_K), dtype=np.float32)
+for i in range(_cooc_sz):
+    s, e = _cooc_cpu.indptr[i], _cooc_cpu.indptr[i + 1]
+    n = e - s
+    if n == 0: continue
+    if n <= TOP_K:
+        _nb[i, :n] = _cooc_cpu.indices[s:e]
+        _sc[i, :n] = _cooc_cpu.data[s:e]
+    else:
+        top = np.argpartition(_cooc_cpu.data[s:e], -TOP_K)[-TOP_K:]
+        _nb[i] = _cooc_cpu.indices[s:e][top]
+        _sc[i] = _cooc_cpu.data[s:e][top]
+_nb_gpu = torch.tensor(_nb, device=device)
+_sc_gpu = torch.tensor(_sc, device=device)
+del _nb, _sc, _cooc_cpu
+print(f"  Built in {_time.time()-_t0:.1f}s")
+
+# --- RRF blend eval: sweep w on full Nov 1-3 eval ---
+ws = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
+ks = [10, 100]
+blend_mrr = {w: 0.0 for w in ws}
+blend_recall = {w: {k: 0 for k in ks} for w in ws}
+cnt_nh = 0
+
+needed = list(set(SCALAR_COLS + SEQ_COLS))
+eval_files = sorted(glob.glob(f"{EVAL_PARQUET_PATH}/*.parquet"))
+_t0 = _time.time()
+total_rows = 0
+
+for fi, fpath in enumerate(eval_files):
+    for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed):
+        iidx = rb.column('item_idx').to_numpy(zero_copy_only=False)
+        rp = np.stack(rb.column('recent_product_ids').to_pandas().values)
+        rm = np.stack(rb.column('recent_product_mask').to_pandas().values)
+        B = len(iidx)
+        total_rows += B
+
+        # Identify novel-hist rows
+        has_hist = rm.sum(axis=1) > 0
+        is_rep = np.zeros(B, dtype=bool)
+        for j in range(rp.shape[1]):
+            is_rep |= ((rp[:,j] == iidx) & (rm[:,j] > 0))
+        is_nh = (~is_rep) & has_hist
+        idx_nh = np.where(is_nh)[0]
+        if len(idx_nh) == 0:
+            continue
+        Bh = len(idx_nh)
+
+        # --- Model scores ---
+        batch = {}
+        for c in SCALAR_COLS:
+            batch[c] = torch.from_numpy(rb.column(c).to_numpy(zero_copy_only=False))
+        for c in SEQ_COLS:
+            batch[c] = torch.from_numpy(np.stack(rb.column(c).to_pandas().values))
+        ub, _ = parquet_batch_to_model_inputs(batch, device)
+        with torch.no_grad():
+            ue = _blend_model.user_tower(**ub)
+        model_scores = ue[idx_nh] @ _item_embs.T  # (Bh, N_items)
+
+        # --- Co-occ scores (scatter-add) ---
+        _rp = torch.tensor(rp[idx_nh], dtype=torch.long, device=device)
+        _rm = torch.tensor(rm[idx_nh], dtype=torch.float32, device=device)
+        g_nb = _nb_gpu[_rp]  # (Bh, 10, TOP_K)
+        g_sc = _sc_gpu[_rp] * _rm.unsqueeze(-1)
+        flat_nb = g_nb.reshape(Bh, -1)
+        flat_sc = g_sc.reshape(Bh, -1)
+        flat_nb_pos = _i2p[flat_nb.clamp(0, _mx)]
+        cooc_scores = torch.zeros(Bh, N_items, device=device)
+        cooc_scores.scatter_add_(1, flat_nb_pos, flat_sc)
+
+        # --- Mask seen items in both ---
+        for j in range(_rp.shape[1]):
+            v = _rm[:, j] > 0
+            r = torch.where(v)[0]
+            if len(r) > 0:
+                pos = _i2p[_rp[r, j].clamp(0, _mx)]
+                model_scores[r, pos] = -float('inf')
+                cooc_scores[r, pos] = -float('inf')
+
+        # --- Target item ---
+        _ti = torch.tensor(iidx[idx_nh], dtype=torch.long, device=device)
+        _ti_pos = _i2p[_ti.clamp(0, _mx)]
+
+        # --- Convert to full ranks via argsort ---
+        arange_items = torch.arange(1, N_items + 1, device=device,
+                                     dtype=torch.float32).unsqueeze(0).expand(Bh, -1)
+
+        m_order = model_scores.argsort(dim=1, descending=True)
+        m_ranks = torch.zeros(Bh, N_items, device=device)
+        m_ranks.scatter_(1, m_order, arange_items)
+        del m_order
+
+        c_order = cooc_scores.argsort(dim=1, descending=True)
+        c_ranks = torch.zeros(Bh, N_items, device=device)
+        c_ranks.scatter_(1, c_order, arange_items)
+        del c_order, model_scores, cooc_scores
+
+        # --- Pre-compute RRF components ---
+        m_comp = 1.0 / (K_RRF + m_ranks)
+        c_comp = 1.0 / (K_RRF + c_ranks)
+        del m_ranks, c_ranks
+
+        arange_bh = torch.arange(Bh, device=device)
+        m_tgt = m_comp[arange_bh, _ti_pos]
+        c_tgt = c_comp[arange_bh, _ti_pos]
+
+        cnt_nh += Bh
+
+        # --- Sweep w ---
+        for w in ws:
+            rrf_tgt = m_tgt + w * c_tgt
+            rrf_all = m_comp + w * c_comp
+            brank = (rrf_all > rrf_tgt.unsqueeze(1)).sum(1).float() + 1
+            blend_mrr[w] += (1.0 / brank).sum().item()
+            for k in ks:
+                blend_recall[w][k] += int((brank <= k).sum().item())
+
+        del m_comp, c_comp
+        torch.cuda.empty_cache()
+
+    if (fi + 1) % 10 == 0 or fi == len(eval_files) - 1:
+        el = _time.time() - _t0
+        print(f"  File {fi+1}/{len(eval_files)}, {total_rows:,} rows, "
+              f"{cnt_nh:,} novel-hist ({el:.0f}s)")
+
+el = _time.time() - _t0
+print(f"\nTotal: {el:.0f}s ({el/60:.1f} min)")
+
+# --- Results ---
+# Reference baselines from cell 29
+REF_MODEL_MRR, REF_MODEL_R10, REF_MODEL_R100 = 0.1218, 0.2624, 0.6125
+REF_COOC_MRR, REF_COOC_R10, REF_COOC_R100 = 0.1277, 0.2783, 0.6363
+
+print(f"\n{'='*75}")
+print(f"  RRF BLEND: logQ model + co-occurrence")
+print(f"  Has-history novel, {cnt_nh:,} rows")
+print(f"  RRF: 1/(60 + rank_model) + w/(60 + rank_cooc)")
+print(f"{'='*75}")
+print(f"\n  {'w':>8} {'MRR':>10} {'R@10':>10} {'R@100':>10}  {'Δ MRR':>8}")
+print(f"  {'-'*55}")
+print(f"  {'ref:mdl':>8} {REF_MODEL_MRR:>10.4f} {REF_MODEL_R10:>10.4f} "
+      f"{REF_MODEL_R100:>10.4f}  {'—':>8}")
+print(f"  {'ref:cooc':>8} {REF_COOC_MRR:>10.4f} {REF_COOC_R10:>10.4f} "
+      f"{REF_COOC_R100:>10.4f}  {'—':>8}")
+
+best_w, best_mrr = None, 0
+for w in ws:
+    mrr_w = blend_mrr[w] / cnt_nh
+    r10_w = blend_recall[w][10] / cnt_nh
+    r100_w = blend_recall[w][100] / cnt_nh
+    delta = mrr_w - REF_MODEL_MRR
+    print(f"  {w:>8.2f} {mrr_w:>10.4f} {r10_w:>10.4f} {r100_w:>10.4f}  {delta:>+8.4f}")
+    if mrr_w > best_mrr:
+        best_mrr, best_w = mrr_w, w
+
+threshold = 0.005
+print(f"\n  Best w = {best_w:.2f}: MRR = {best_mrr:.4f} (Δ = {best_mrr - REF_MODEL_MRR:+.4f})")
+if best_mrr - REF_MODEL_MRR >= threshold:
+    print(f"  → Gain ≥ {threshold} — blend worth testing on held-out")
+else:
+    print(f"  → Gain < {threshold} — model alone is sufficient")
+print(f"\n  Note: w=0 should reproduce model-only (minor float diffs from argsort)")
+print(f"  Note: blend requires serving co-occ lookup table + rank merge in pyfunc")
+print(f"{'='*75}")
+
+# Clean up large GPU tensors
+del _nb_gpu, _sc_gpu, _item_embs, _i2p
+
+# COMMAND ----------
+
+# DBTITLE 1,Export Nov 4-6 test set to Parquet
+# ---------------------------------------------------------------------------
+# Export Nov 4-6 test set to Parquet, same transforms as eval.
+# Requires cells 2-7 (vocabs, transforms) to have been run in this session.
+# ---------------------------------------------------------------------------
+TEST_TABLE = f"{CATALOG}.{SCHEMA}.two_tower_fv_test"
+TEST_PARQUET_PATH = f"{VOLUME_BASE}/session_test"
+
+_t0 = _time.time()
+test_sdf = spark.table(TEST_TABLE)
+print(f"Test table: {test_sdf.count():,} rows")
+
+test_exported = (
+    test_sdf
+    .mapInPandas(make_transform_fn(vocabs), schema=output_schema)
+    .select(*MODEL_COLUMNS, "event_time")
+)
+test_exported.write.mode("overwrite").parquet(TEST_PARQUET_PATH)
+
+import pyarrow.parquet as pq
+test_row_count = sum(
+    pq.ParquetFile(f).metadata.num_rows
+    for f in glob.glob(f"{TEST_PARQUET_PATH}/*.parquet")
+)
+print(f"Test exported: {test_row_count:,} rows \u2192 {TEST_PARQUET_PATH}")
+print(f"  in {_time.time() - _t0:.1f}s")
+
+# COMMAND ----------
+
+# DBTITLE 1,Nov 4-6 final eval: blend + baselines (single pass)
+# ---------------------------------------------------------------------------
+# FINAL HELD-OUT EVAL: Nov 4-6 test set.
+# One pass, no iteration. Blend at w=1.0 + model-only + co-occ-only.
+# ---------------------------------------------------------------------------
+import pickle, time as _time
+
+K_RRF = 60
+BLEND_W = 1.0
+
+# --- Train logQ model ---
+print("Training logQ model (seed=42)...")
+_test_model = create_fresh_model()
+train_with_logq(_test_model, seed=42, num_epochs=NUM_EPOCHS)
+_test_model.eval()
+
+# --- Item embeddings ---
+from evaluation import load_evaluation_lookups
+_if, _, _ = load_evaluation_lookups(VOLUME_BASE)
+_long_cols = ['item_idx','category_idx','category_l2_idx','category_l3_idx','brand_idx']
+_float_cols = ['item_log_price','price_pct_rank','price_pct_rank_l2',
+               'item_popularity','item_conversion_rate','item_cart_to_purchase_rate','item_recency_val']
+with torch.no_grad():
+    _al = [torch.tensor(_if[c].values, dtype=torch.long, device=device) for c in _long_cols]
+    _af = [torch.tensor(_if[c].values, dtype=torch.float32, device=device) for c in _float_cols]
+    _item_embs = TF.normalize(_test_model.item_tower(*_al, *_af), dim=1)
+_ia = _if['item_idx'].values
+_mx = int(_ia.max())
+N_items = len(_ia)
+_i2p = torch.full((_mx+1,), 0, dtype=torch.long, device=device)
+_i2p[torch.tensor(_ia, device=device)] = torch.arange(N_items, device=device)
+print(f"Item embeddings: {N_items:,} items")
+
+# --- Co-occ neighbor index ---
+print("Loading co-occurrence matrix...")
+with open(f"{VOLUME_BASE}/cooc_matrix.pkl", "rb") as f:
+    _cooc_cpu = pickle.load(f)
+_cooc_sz = _cooc_cpu.shape[0]
+TOP_K = 150
+_t0 = _time.time()
+_nb = np.zeros((_cooc_sz, TOP_K), dtype=np.int64)
+_sc = np.zeros((_cooc_sz, TOP_K), dtype=np.float32)
+for i in range(_cooc_sz):
+    s, e = _cooc_cpu.indptr[i], _cooc_cpu.indptr[i + 1]
+    n = e - s
+    if n == 0: continue
+    if n <= TOP_K:
+        _nb[i, :n] = _cooc_cpu.indices[s:e]
+        _sc[i, :n] = _cooc_cpu.data[s:e]
+    else:
+        top = np.argpartition(_cooc_cpu.data[s:e], -TOP_K)[-TOP_K:]
+        _nb[i] = _cooc_cpu.indices[s:e][top]
+        _sc[i] = _cooc_cpu.data[s:e][top]
+_nb_gpu = torch.tensor(_nb, device=device)
+_sc_gpu = torch.tensor(_sc, device=device)
+del _nb, _sc, _cooc_cpu
+print(f"  Built in {_time.time()-_t0:.1f}s")
+
+# --- Eval loop: all three slices ---
+ks = [10, 100]
+# Accumulators: blend, model-only, cooc-only for novel-hist
+blend_mrr, mdl_mrr, cooc_mrr = 0.0, 0.0, 0.0
+blend_r = {k: 0 for k in ks}
+mdl_r = {k: 0 for k in ks}
+cooc_r = {k: 0 for k in ks}
+cnt_nh = 0
+# Repeat + first-event (model-only)
+rep_mrr, rep_r10, cnt_rep = 0.0, 0, 0
+fe_mrr, fe_r10, cnt_fe = 0.0, 0, 0
+
+needed = list(set(SCALAR_COLS + SEQ_COLS))
+test_files = sorted(glob.glob(f"{TEST_PARQUET_PATH}/*.parquet"))
+print(f"\nEval on {len(test_files)} test files...")
+_t0 = _time.time()
+total_rows = 0
+
+for fi, fpath in enumerate(test_files):
+    for rb in pq.ParquetFile(fpath).iter_batches(2048, columns=needed):
+        iidx = rb.column('item_idx').to_numpy(zero_copy_only=False)
+        rp = np.stack(rb.column('recent_product_ids').to_pandas().values)
+        rm = np.stack(rb.column('recent_product_mask').to_pandas().values)
+        B = len(iidx)
+        total_rows += B
+
+        has_hist = rm.sum(axis=1) > 0
+        is_rep = np.zeros(B, dtype=bool)
+        for j in range(rp.shape[1]):
+            is_rep |= ((rp[:,j] == iidx) & (rm[:,j] > 0))
+        is_nh = (~is_rep) & has_hist
+        is_fe = (~is_rep) & (~has_hist)
+
+        # --- Model scores for ALL rows with history ---
+        idx_hist = np.where(has_hist)[0]
+        if len(idx_hist) > 0:
+            batch = {}
+            for c in SCALAR_COLS:
+                batch[c] = torch.from_numpy(rb.column(c).to_numpy(zero_copy_only=False))
+            for c in SEQ_COLS:
+                batch[c] = torch.from_numpy(np.stack(rb.column(c).to_pandas().values))
+            ub, _ = parquet_batch_to_model_inputs(batch, device)
+            with torch.no_grad():
+                ue = _test_model.user_tower(**ub)
+
+        # --- Repeat rows (model-only, no masking) ---
+        idx_rep = np.where(is_rep)[0]
+        if len(idx_rep) > 0:
+            rep_scores = ue[idx_rep] @ _item_embs.T
+            _ti = torch.tensor(iidx[idx_rep], dtype=torch.long, device=device)
+            _tp = _i2p[_ti.clamp(0, _mx)]
+            tgt = rep_scores[torch.arange(len(idx_rep), device=device), _tp]
+            ranks = (rep_scores > tgt.unsqueeze(1)).sum(1).float() + 1
+            rep_mrr += (1.0 / ranks).sum().item()
+            rep_r10 += int((ranks <= 10).sum().item())
+            cnt_rep += len(idx_rep)
+            del rep_scores
+
+        # --- First-event rows (model-only, item-mean fallback) ---
+        idx_fe = np.where(is_fe)[0]
+        if len(idx_fe) > 0:
+            # First-event: use item-mean of ALL items as query (global average)
+            # Actually, first-event has no history, so user tower uses zero history.
+            # We still run the user tower — it produces an embedding from the numeric features alone.
+            fe_batch = {}
+            for c in SCALAR_COLS:
+                fe_batch[c] = torch.from_numpy(rb.column(c).to_numpy(zero_copy_only=False))
+            for c in SEQ_COLS:
+                fe_batch[c] = torch.from_numpy(np.stack(rb.column(c).to_pandas().values))
+            fe_ub, _ = parquet_batch_to_model_inputs(fe_batch, device)
+            with torch.no_grad():
+                fe_ue = _test_model.user_tower(**fe_ub)
+            fe_scores = fe_ue[idx_fe] @ _item_embs.T
+            _ti = torch.tensor(iidx[idx_fe], dtype=torch.long, device=device)
+            _tp = _i2p[_ti.clamp(0, _mx)]
+            tgt = fe_scores[torch.arange(len(idx_fe), device=device), _tp]
+            ranks = (fe_scores > tgt.unsqueeze(1)).sum(1).float() + 1
+            fe_mrr += (1.0 / ranks).sum().item()
+            fe_r10 += int((ranks <= 10).sum().item())
+            cnt_fe += len(idx_fe)
+            del fe_scores
+
+        # --- Novel-hist rows: blend ---
+        idx_nh = np.where(is_nh)[0]
+        if len(idx_nh) == 0:
+            continue
+        Bh = len(idx_nh)
+
+        model_scores = ue[idx_nh] @ _item_embs.T
+
+        _rp = torch.tensor(rp[idx_nh], dtype=torch.long, device=device)
+        _rm = torch.tensor(rm[idx_nh], dtype=torch.float32, device=device)
+        g_nb = _nb_gpu[_rp]
+        g_sc = _sc_gpu[_rp] * _rm.unsqueeze(-1)
+        flat_nb = g_nb.reshape(Bh, -1)
+        flat_sc = g_sc.reshape(Bh, -1)
+        flat_nb_pos = _i2p[flat_nb.clamp(0, _mx)]
+        cooc_scores = torch.zeros(Bh, N_items, device=device)
+        cooc_scores.scatter_add_(1, flat_nb_pos, flat_sc)
+
+        for j in range(_rp.shape[1]):
+            v = _rm[:, j] > 0
+            r = torch.where(v)[0]
+            if len(r) > 0:
+                pos = _i2p[_rp[r, j].clamp(0, _mx)]
+                model_scores[r, pos] = -float('inf')
+                cooc_scores[r, pos] = -float('inf')
+
+        _ti = torch.tensor(iidx[idx_nh], dtype=torch.long, device=device)
+        _ti_pos = _i2p[_ti.clamp(0, _mx)]
+
+        # Model-only rank
+        tgt_m = model_scores[torch.arange(Bh, device=device), _ti_pos]
+        m_rank = (model_scores > tgt_m.unsqueeze(1)).sum(1).float() + 1
+        mdl_mrr += (1.0 / m_rank).sum().item()
+        for k in ks:
+            mdl_r[k] += int((m_rank <= k).sum().item())
+
+        # Co-occ rank (expected-rank tie-breaking)
+        tgt_c = cooc_scores[torch.arange(Bh, device=device), _ti_pos]
+        n_gt = (cooc_scores > tgt_c.unsqueeze(1)).sum(1)
+        n_tied = (cooc_scores == tgt_c.unsqueeze(1)).sum(1) - 1
+        c_rank = n_gt.float() + 1.0 + n_tied.float() / 2.0
+        cooc_mrr += (1.0 / c_rank).sum().item()
+        for k in ks:
+            cooc_r[k] += int((c_rank <= k).sum().item())
+
+        # Blend: full ranks via argsort + RRF
+        arange_items = torch.arange(1, N_items + 1, device=device,
+                                     dtype=torch.float32).unsqueeze(0).expand(Bh, -1)
+        m_order = model_scores.argsort(dim=1, descending=True)
+        m_ranks = torch.zeros(Bh, N_items, device=device)
+        m_ranks.scatter_(1, m_order, arange_items)
+        del m_order
+        c_order = cooc_scores.argsort(dim=1, descending=True)
+        c_ranks = torch.zeros(Bh, N_items, device=device)
+        c_ranks.scatter_(1, c_order, arange_items)
+        del c_order, model_scores, cooc_scores
+
+        m_comp = 1.0 / (K_RRF + m_ranks)
+        c_comp = 1.0 / (K_RRF + c_ranks)
+        del m_ranks, c_ranks
+
+        arange_bh = torch.arange(Bh, device=device)
+        rrf_tgt = m_comp[arange_bh, _ti_pos] + BLEND_W * c_comp[arange_bh, _ti_pos]
+        rrf_all = m_comp + BLEND_W * c_comp
+        brank = (rrf_all > rrf_tgt.unsqueeze(1)).sum(1).float() + 1
+        blend_mrr += (1.0 / brank).sum().item()
+        for k in ks:
+            blend_r[k] += int((brank <= k).sum().item())
+        cnt_nh += Bh
+
+        del m_comp, c_comp
+        torch.cuda.empty_cache()
+
+    if (fi + 1) % 10 == 0 or fi == len(test_files) - 1:
+        el = _time.time() - _t0
+        print(f"  File {fi+1}/{len(test_files)}, {total_rows:,} rows ({el:.0f}s)")
+
+el = _time.time() - _t0
+print(f"\nTotal: {el:.0f}s ({el/60:.1f} min), {total_rows:,} rows")
+
+# --- Results ---
+print(f"\n{'='*80}")
+print(f"  HELD-OUT TEST: Nov 4-6 (single pass, no tuning)")
+print(f"{'='*80}")
+
+print(f"\n  HAS-HISTORY NOVEL ({cnt_nh:,} rows):")
+print(f"  {'Method':>16} {'MRR':>10} {'R@10':>10} {'R@100':>10}")
+print(f"  {'-'*50}")
+print(f"  {'Model alone':>16} {mdl_mrr/cnt_nh:>10.4f} {mdl_r[10]/cnt_nh:>10.4f} {mdl_r[100]/cnt_nh:>10.4f}")
+print(f"  {'Co-occ alone':>16} {cooc_mrr/cnt_nh:>10.4f} {cooc_r[10]/cnt_nh:>10.4f} {cooc_r[100]/cnt_nh:>10.4f}")
+print(f"  {'Blend w=1.0':>16} {blend_mrr/cnt_nh:>10.4f} {blend_r[10]/cnt_nh:>10.4f} {blend_r[100]/cnt_nh:>10.4f}")
+
+print(f"\n  REPEAT ({cnt_rep:,} rows):  MRR={rep_mrr/max(cnt_rep,1):.4f}  R@10={rep_r10/max(cnt_rep,1):.4f}")
+print(f"  FIRST-EVENT ({cnt_fe:,} rows): MRR={fe_mrr/max(cnt_fe,1):.4f}  R@10={fe_r10/max(cnt_fe,1):.4f}")
+
+# Comparison with eval-set numbers
+print(f"\n  COMPARISON (eval Nov 1-3 vs test Nov 4-6, has-history novel):")
+print(f"  {'':>16} {'Eval MRR':>10} {'Test MRR':>10} {'\u0394':>8}")
+print(f"  {'-'*50}")
+print(f"  {'Model':>16} {'0.1218':>10} {mdl_mrr/cnt_nh:>10.4f} {mdl_mrr/cnt_nh - 0.1218:>+8.4f}")
+print(f"  {'Co-occ':>16} {'0.1277':>10} {cooc_mrr/cnt_nh:>10.4f} {cooc_mrr/cnt_nh - 0.1277:>+8.4f}")
+print(f"  {'Blend':>16} {'0.1365':>10} {blend_mrr/cnt_nh:>10.4f} {blend_mrr/cnt_nh - 0.1365:>+8.4f}")
+print(f"{'='*80}")
+
+del _nb_gpu, _sc_gpu, _item_embs, _i2p, _test_model

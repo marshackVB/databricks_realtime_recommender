@@ -1,9 +1,6 @@
 # Workspace-specific config (use config_template.yml as a starting point)
 config.yml
 
-# Dev notebooks (local exploration, not part of the public project)
-dev/
-
 # Python bytecode
 __pycache__/
 *.pyc

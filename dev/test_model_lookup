@@ -1,0 +1,195 @@
+# Databricks notebook source
+# DBTITLE 1,Title
+# MAGIC %md
+# MAGIC # Feature Lookup Smoke Test
+# MAGIC
+# MAGIC Deploy a trivial pyfunc via `fe.log_model` to verify that the FE wrapper correctly looks up session features from the Lakebase online store. No Vector Search, no torch, no auth secrets.
+
+# COMMAND ----------
+
+# DBTITLE 1,Setup
+# MAGIC %pip install databricks-feature-engineering>=0.16.0 --quiet
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# DBTITLE 1,Imports and config
+import mlflow, yaml, os, importlib.util
+from databricks.feature_engineering import FeatureEngineeringClient
+from databricks.sdk import WorkspaceClient
+import pyspark.sql.functions as F
+
+fe = FeatureEngineeringClient()
+w = WorkspaceClient()
+
+_project_root = os.getcwd()
+with open(os.path.join(_project_root, "config.yml")) as f:
+    config = yaml.safe_load(f)
+
+CATALOG = config["catalog"]
+SCHEMA = config["schema"]
+STAGE1_RUN_ID = config["run_id_to_deploy"]
+SESSION_TRAIN_TABLE = f"{CATALOG}.{SCHEMA}.{config['session_train_table']}"
+TEST_ENDPOINT = "test-feature-lookup"
+TEST_MODEL = f"{CATALOG}.{SCHEMA}.test_feature_lookup_model"
+
+print(f"Stage 1 run: {STAGE1_RUN_ID}")
+print(f"Test endpoint: {TEST_ENDPOINT}")
+print(f"Test UC model: {TEST_MODEL}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Define trivial echo pyfunc + log with fe.log_model
+# ---------------------------------------------------------------------------
+# Trivial pyfunc: receives FE-enriched input, echoes all columns back.
+# If session features (session_event_count, session_avg_price, etc.) appear
+# in the output, the FE wrapper + Lakebase online store lookup is working.
+# ---------------------------------------------------------------------------
+
+class FeatureLookupEcho(mlflow.pyfunc.PythonModel):
+    def predict(self, context, model_input, params=None):
+        import pandas as pd
+        df = model_input if isinstance(model_input, pd.DataFrame) else pd.DataFrame(model_input)
+        return df
+
+# --- Reconstruct feature spec from Stage 1 artifacts ---
+user_artifact_dir = mlflow.artifacts.download_artifacts(
+    run_id=STAGE1_RUN_ID, artifact_path="user_tower_pyfunc"
+)
+feature_spec_path = os.path.join(
+    user_artifact_dir, "data", "feature_store", "feature_spec.yaml"
+)
+with open(feature_spec_path) as f:
+    feature_spec = yaml.safe_load(f)
+
+feature_names = feature_spec["features"]
+features = [fe.get_feature(full_name=fn) for fn in feature_names]
+print(f"Features ({len(features)}):")
+for fn in feature_names:
+    print(f"  {fn.split('.')[-1]}")
+
+# --- Build labeled sample for create_training_set (schema only) ---
+input_col_info = {}
+for col_dict in feature_spec["input_columns"]:
+    for col_name, col_props in col_dict.items():
+        input_col_info[col_name] = col_props
+
+exclude_cols = [k for k, v in input_col_info.items() if not v["include"]]
+required_cols = list(input_col_info.keys()) + ["event_type"]
+labeled_sample = spark.table(SESSION_TRAIN_TABLE).limit(1)
+
+for col_name, props in input_col_info.items():
+    if col_name not in labeled_sample.columns:
+        cast_type = {"double": "double", "date": "date", "int": "int",
+                     "string": "string", "timestamp": "timestamp"}.get(props["data_type"], "string")
+        labeled_sample = labeled_sample.withColumn(col_name, F.lit(None).cast(cast_type))
+
+labeled_sample = labeled_sample.select(*required_cols)
+
+log_training_set = fe.create_training_set(
+    df=labeled_sample,
+    features=features,
+    label="event_type",
+    exclude_columns=exclude_cols,
+)
+
+# --- Log echo model via fe.log_model (no resources, no torch) ---
+mlflow.end_run()
+with mlflow.start_run(run_name="feature_lookup_smoke_test") as run:
+    test_run_id = run.info.run_id
+    fe.log_model(
+        model=FeatureLookupEcho(),
+        artifact_path="echo_model",
+        flavor=mlflow.pyfunc,
+        training_set=log_training_set,
+        pip_requirements=["pandas"],
+    )
+    mv = mlflow.register_model(f"runs:/{test_run_id}/echo_model", TEST_MODEL)
+    print(f"\nRegistered {TEST_MODEL} version {mv.version}")
+    print(f"Run: {test_run_id}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Deploy test endpoint
+import time
+from databricks.sdk.service.serving import (
+    EndpointCoreConfigInput, ServedEntityInput,
+)
+
+served = ServedEntityInput(
+    entity_name=TEST_MODEL,
+    entity_version=str(mv.version),
+    workload_size="Small",
+    scale_to_zero_enabled=True,
+)
+
+try:
+    w.serving_endpoints.create(
+        name=TEST_ENDPOINT,
+        config=EndpointCoreConfigInput(name=TEST_ENDPOINT, served_entities=[served]),
+    )
+    print(f"Endpoint '{TEST_ENDPOINT}' created.")
+except Exception as e:
+    if "already exists" in str(e):
+        w.serving_endpoints.update_config(
+            name=TEST_ENDPOINT,
+            served_entities=[served],
+        )
+        print(f"Endpoint '{TEST_ENDPOINT}' updated to version {mv.version}.")
+    else:
+        raise
+
+# Poll for ready (shorter timeout for a lightweight model)
+for i in range(40):
+    ep = w.serving_endpoints.get(name=TEST_ENDPOINT)
+    state = ep.state
+    print(f"  [{i*30}s] ready={state.ready}, config={state.config_update}")
+    if str(state.config_update) == "EndpointStateConfigUpdate.NOT_UPDATING":
+        print(f"\n✓ Endpoint READY")
+        break
+    if "FAILED" in str(state.config_update):
+        # Print failure details
+        for se in (ep.pending_config or ep.config).served_entities:
+            if se.state:
+                print(f"  FAILED: {se.state.deployment_state_message}")
+        break
+    time.sleep(30)
+else:
+    print("Timeout — check Serving UI.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Query test endpoint
+import json
+
+payload = {
+    "dataframe_records": [
+        {
+            "user_session": "7e81ceca-4dec-451f-947d-ebc366b1243d",
+            "product_id": 1005115,
+            "category_l1": "electronics",
+            "category_l2": "smartphone",
+            "relevance": 1,
+            "session_cart_value": 0.0,
+            "hour_of_day": 14,
+            "day_of_week": 3,
+        }
+    ]
+}
+
+resp = w.serving_endpoints.query(name=TEST_ENDPOINT, dataframe_records=payload["dataframe_records"])
+print("Response:")
+print(json.dumps(resp.as_dict(), indent=2))
+
+# Check which session features came back from Lakebase
+if resp.predictions:
+    row = resp.predictions[0] if isinstance(resp.predictions, list) else resp.predictions
+    lakebase_features = ["session_event_count", "session_avg_price", "session_price_stddev", "session_total_value"]
+    print("\n--- Lakebase Feature Lookup Results ---")
+    for feat in lakebase_features:
+        val = row.get(feat, "MISSING")
+        print(f"  {feat}: {val}")
+    if all(row.get(f) is not None and row.get(f) != "MISSING" for f in lakebase_features):
+        print("\n✓ All session features resolved from Lakebase online store!")
+    else:
+        print("\n✗ Some session features missing — check online store materialization.")

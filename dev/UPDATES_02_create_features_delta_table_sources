@@ -1,0 +1,718 @@
+# Databricks notebook source
+# DBTITLE 1,Feature Store Integration — Two-Tower Recommender
+# MAGIC %md
+# MAGIC # Feature Store Integration — Two-Tower Recommender
+# MAGIC
+# MAGIC Define Databricks Feature Views for real-time Feature calculations and online features lookups.
+
+# COMMAND ----------
+
+# MAGIC %pip install databricks-feature-engineering>=0.16.0
+# MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# DBTITLE 1,Feature View Implementation
+# MAGIC %md
+# MAGIC %md
+# MAGIC ### Feature View Implementation
+# MAGIC
+# MAGIC **TODO:** `session_category_diversity` is deferred. It requires `ApproxCountDistinct`, which is not supported on streaming `RollingWindow` features. Options to revisit:
+# MAGIC 1. Per-category `Count` features via streaming `RollingWindow` with `filter_condition` (14 features, one per L1 category)
+# MAGIC 2. Client-side tracking in the application layer
+# MAGIC 3. Ablation to determine if the feature carries enough signal to justify the complexity
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Step 1: Split features into daily batch and real-time aggregate features.
+# MAGIC Daily batch features are product-level features, including product ID, product category, and price. These features are updated as part of a batch job. Real-time aggregate features include two types of features, product-level aggegates and user session-level aggregates. Both of these features types are derived from sessions-level clickstream data, they exist in different online tables and their computation frequency is different.
+# MAGIC
+# MAGIC Product-level aggregates are computed on session-level data, but they are update on a schedule cadence. Thinks of features like the number of purchases of a product over the past 7 days. These feature do not need to be calculated in near real time.
+# MAGIC
+# MAGIC User session-level aggregates are capture in near real time via a StreamSource. These features are derived from a user's actions while browsing the website. They exist in their own Lakebase table. The StreamSource writes non-aggregated, raw clickstream events to a Delta table. This Delta table is used as a source to Derive product-level features.
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+from databricks.feature_engineering import FeatureEngineeringClient
+from databricks.feature_engineering.entities import (
+    DeltaTableSource, Feature, AggregationFunction,
+    Count, Max, Min, SlidingWindow, Sum, Avg,
+    StddevPop, RollingWindow,RequestSource, FieldDefinition, 
+    ScalarDataType,  ColumnSelection, OfflineStoreConfig, 
+    OnlineStoreConfig, CronSchedule, TableTrigger,
+)
+
+from datetime import timedelta
+
+fe = FeatureEngineeringClient()
+
+# COMMAND ----------
+
+# DBTITLE 1,Load config and define constants
+import yaml
+import os
+from databricks.feature_engineering import FeatureEngineeringClient
+
+# Load project config
+config_path = os.path.join(os.getcwd(), "config.yml")
+with open(config_path) as f:
+    config = yaml.safe_load(f)
+
+CATALOG = config["catalog"]
+SCHEMA = config["schema"]
+CLICKSTREAM_TABLE = config['ecommerce_table']
+PRODUCT_TABLE = config['product_table']
+ONLINE_STORE = config["online_store"]
+
+# Create online store if it doesn't exist
+fe = FeatureEngineeringClient()
+store = fe.get_online_store(name=ONLINE_STORE)
+if store is not None:
+    print(f"Online store '{ONLINE_STORE}' exists (state: {store.state})")
+else:
+    fe.create_online_store(name=ONLINE_STORE, capacity="CU_1")
+    print(f"Created online store '{ONLINE_STORE}'")
+
+print(f"Catalog: {CATALOG}")
+print(f"Schema:  {SCHEMA}")
+print(f"Clickstream table:   {CLICKSTREAM_TABLE}")
+print(f"Product table:   {PRODUCT_TABLE}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Create Feature Views
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ######Product batch views
+# MAGIC
+# MAGIC Sourced from ecommerce_product (1 row/product/day). ColumnSelection resolves the latest attribute value per product BEFORE
+# MAGIC each event's timestamp. The product catalog table handles attribute drift (price changes, recategorization, brand updates) with one row per product per day. In production, materialized to Lakebase via TableTrigger (refreshed whenever the source table changes).
+# MAGIC
+
+# COMMAND ----------
+
+# DBTITLE 1,Product Batch Features — Static Catalog
+product_source = DeltaTableSource(
+    catalog_name=CATALOG,
+    schema_name=SCHEMA,
+    table_name=PRODUCT_TABLE,
+)
+
+# Static catalog features (latest value per product)
+item_price = Feature(
+    source=product_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=ColumnSelection("price"),
+    name="item_price",
+)
+
+item_category_l1 = Feature(
+    source=product_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=ColumnSelection("category_l1"),
+    name="item_category_l1",
+)
+
+item_category_l2 = Feature(
+    source=product_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=ColumnSelection("category_l2"),
+    name="item_category_l2",
+)
+
+item_category_l3 = Feature(
+    source=product_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=ColumnSelection("category_l3"),
+    name="item_category_l3",
+)
+
+item_brand = Feature(
+    source=product_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=ColumnSelection("brand"),
+    name="item_brand",
+)
+
+item_log_price = Feature(
+    source=product_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=ColumnSelection("log_price"),
+    name="item_log_price",
+)
+
+product_batch_features = [
+    item_price,
+    item_category_l1,
+    item_category_l2,
+    item_category_l3,
+    item_brand,
+    item_log_price,
+]
+
+# COMMAND ----------
+
+# DBTITLE 1,Verify Product Batch Features
+product_batch_df = fe.compute_features(features=product_batch_features)
+print(f"Product batch features computed: {product_batch_df.count():,} rows")
+display(product_batch_df.limit(10))
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell 11
+# MAGIC %md
+# MAGIC ######Product rolling aggregate views
+# MAGIC Product-level rolling aggregates — sourced from ecommerce_clickstream and ecommerce_product
+# MAGIC
+# MAGIC These features capture item behavioral signals over a trailing 7-day SlidingWindow (slide=1d).
+# MAGIC Updated on a daily CronSchedule in production (not real-time).
+# MAGIC
+# MAGIC **Event counts** (from ecommerce_clickstream): Count features use filtered DeltaTableSources (one per event type) because filter_condition lives on the source, not the AggregationFunction. item_recency uses Max on the unfiltered clickstream.
+# MAGIC
+# MAGIC **Category price bounds** (from ecommerce_product): Min/Max price per category_l1 and category_l2, sourced from the product catalog (one row per product per day) for aggregation at product grain rather than event grain — avoids over-weighting popular items in the price range.
+# MAGIC
+# MAGIC The pyfunc model derives final features at inference time:  
+# MAGIC
+# MAGIC  - item_popularity = log1p(item_view_count). 
+# MAGIC  - item_conversion_rate = (item_purchase_count + 1) / (item_view_count + 10)
+# MAGIC  - item_cart_to_purchase_rate = (item_purchase_count + 1) / (item_cart_count + 10). 
+# MAGIC  - recency_decay = 1.0 / (1.0 + days_since(item_recency, now)). 
+# MAGIC  - price_pct_rank \~ (price - category_min) / (category_max - category_min)
+
+# COMMAND ----------
+
+# DBTITLE 1,Product Rolling Aggregate Features — Clickstream SlidingWindow
+clickstream_source = DeltaTableSource(
+    catalog_name=CATALOG,
+    schema_name=SCHEMA,
+    table_name=CLICKSTREAM_TABLE,
+)
+
+view_source = DeltaTableSource(
+    catalog_name=CATALOG,
+    schema_name=SCHEMA,
+    table_name=CLICKSTREAM_TABLE,
+    filter_condition="event_type = 'view'",
+)
+
+cart_source = DeltaTableSource(
+    catalog_name=CATALOG,
+    schema_name=SCHEMA,
+    table_name=CLICKSTREAM_TABLE,
+    filter_condition="event_type = 'cart'",
+)
+
+purchase_source = DeltaTableSource(
+    catalog_name=CATALOG,
+    schema_name=SCHEMA,
+    table_name=CLICKSTREAM_TABLE,
+    filter_condition="event_type = 'purchase'",
+)
+
+PRODUCT_AGG_WINDOW = SlidingWindow(
+    window_duration=timedelta(days=7),
+    slide_duration=timedelta(days=1),
+)
+
+# --- Item event counts (mlflow pyfunc derives popularity, conversion rates)
+item_view_count = Feature(
+    source=view_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Count(input="event_type"), PRODUCT_AGG_WINDOW),
+    name="item_view_count",
+)
+
+item_cart_count = Feature(
+    source=cart_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Count(input="event_type"), PRODUCT_AGG_WINDOW),
+    name="item_cart_count",
+)
+
+item_purchase_count = Feature(
+    source=purchase_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Count(input="event_type"), PRODUCT_AGG_WINDOW),
+    name="item_purchase_count",
+)
+
+# --- Item recency: most recent interaction timestamp per product
+# Max(input="event_time") fails because event_time is the timeseries_column.
+# Workaround: ecommerce_clickstream has event_time_copy (duplicate) which
+# can be aggregated normally.
+item_recency = Feature(
+    source=clickstream_source,
+    entity=["product_id"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Max(input="event_time_copy"), PRODUCT_AGG_WINDOW),
+    name="item_recency",
+)
+
+# --- Category-level price bounds (pyfunc derives price_pct_rank)
+# percent_rank() is not available as a Feature Views operator.
+# Approximation: store Min/Max price per category from the product catalog,
+# then pyfunc computes price_pct_rank ≈ (price - min) / (max - min).
+# Sourced from ecommerce_product (not clickstream) for cleaner aggregation
+# over distinct product snapshots rather than event-weighted duplicates.
+category_l1_min_price = Feature(
+    source=product_source,
+    entity=["category_l1"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Min(input="price"), PRODUCT_AGG_WINDOW),
+    name="category_l1_min_price",
+)
+
+category_l1_max_price = Feature(
+    source=product_source,
+    entity=["category_l1"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Max(input="price"), PRODUCT_AGG_WINDOW),
+    name="category_l1_max_price",
+)
+
+category_l2_min_price = Feature(
+    source=product_source,
+    entity=["category_l2"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Min(input="price"), PRODUCT_AGG_WINDOW),
+    name="category_l2_min_price",
+)
+
+category_l2_max_price = Feature(
+    source=product_source,
+    entity=["category_l2"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Max(input="price"), PRODUCT_AGG_WINDOW),
+    name="category_l2_max_price",
+)
+
+# --- Collect product rolling aggregate features ---
+product_count_features = [
+    item_view_count,
+    item_cart_count,
+    item_purchase_count,
+    item_recency,
+]
+
+product_price_bound_features = [
+    category_l1_min_price,
+    category_l1_max_price,
+    category_l2_min_price,
+    category_l2_max_price,
+]
+
+product_rolling_features = product_count_features + product_price_bound_features
+
+# COMMAND ----------
+
+# Verify count features
+agg_df = fe.compute_features(features=product_count_features)
+print(f"\nCount features computed: {agg_df.count():,} rows")
+display(agg_df.limit(10))
+
+# Verify price bound features
+price_df = fe.compute_features(features=product_price_bound_features)
+print(f"\nPrice bound features computed: {price_df.count():,} rows")
+display(price_df.limit(10))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ######Session-level rolling aggregate views
+# MAGIC
+# MAGIC These features capture a user's browsing behavior within the current session.
+# MAGIC
+# MAGIC INTERIM: Using SlidingWindow(24h, 1h slide) with DeltaTableSource so that features can be materialized via CronSchedule → offline + Lakebase. PRODUCTION MIGRATION: Switch to RollingWindow(24h) + StreamSource + StreamingMode() when Kafka stream is available. The operators
+# MAGIC (Count, Avg, StddevPop, Sum) are compatible with both window types.
+# MAGIC
+# MAGIC session_category_diversity is DEFERRED — requires ApproxCountDistinct,which is not supported on RollingWindow. Workarounds documented in README.
+
+# COMMAND ----------
+
+# DBTITLE 1,Session-Level Aggregate Features — Clickstream SlidingWindow
+session_source = DeltaTableSource(
+    catalog_name=CATALOG,
+    schema_name=SCHEMA,
+    table_name=CLICKSTREAM_TABLE,
+)
+
+SESSION_WINDOW = SlidingWindow(
+    window_duration=timedelta(hours=24),
+    slide_duration=timedelta(hours=1),
+)
+
+# --- Session event count (browsing intensity) ---
+session_event_count = Feature(
+    source=session_source,
+    entity=["user_session"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Count(input="event_type"), SESSION_WINDOW),
+    name="session_event_count",
+)
+
+# --- Session average price (price tier browsing pattern) ---
+session_avg_price = Feature(
+    source=session_source,
+    entity=["user_session"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Avg(input="price"), SESSION_WINDOW),
+    name="session_avg_price",
+)
+
+# --- Session price standard deviation (price diversity) ---
+session_price_stddev = Feature(
+    source=session_source,
+    entity=["user_session"],
+    timeseries_column="event_time",
+    function=AggregationFunction(StddevPop(input="price"), SESSION_WINDOW),
+    name="session_price_stddev",
+)
+
+# --- Session total value (cumulative spend signal) ---
+session_total_value = Feature(
+    source=session_source,
+    entity=["user_session"],
+    timeseries_column="event_time",
+    function=AggregationFunction(Sum(input="price"), SESSION_WINDOW),
+    name="session_total_value",
+)
+
+# --- Collect session rolling features ---
+session_rolling_features = [
+    session_event_count,
+    session_avg_price,
+    session_price_stddev,
+    session_total_value,
+]
+
+# COMMAND ----------
+
+# DBTITLE 1,Verify Session Features (optional)
+# Optional: compute and inspect session features (expensive on full dataset)
+session_df = fe.compute_features(features=session_rolling_features)
+print(f"Session features computed: {session_df.count():,} rows")
+display(session_df.limit(10))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ######RequestSource features
+# MAGIC These are features that will ultimately be passed in to the model serving endpoint request; they are session-derived clickstream features passed at serving time.
+# MAGIC
+# MAGIC These include the below types of features.
+# MAGIC     - Properties of the current event (relevance, hour_of_day, day_of_week)
+# MAGIC     - Incompatible with streaming RollingWindow operators (last_category needs Last — resolved via product_id lookup on item feature table)
+# MAGIC     -  session_category_diversity is DEFERRED (see markdown cell above)
+
+# COMMAND ----------
+
+# DBTITLE 1,RequestSource Features
+request_source = RequestSource(
+    schema=[
+        FieldDefinition(name="product_id", data_type=ScalarDataType.INTEGER),
+        FieldDefinition(name="category_l1", data_type=ScalarDataType.STRING),
+        FieldDefinition(name="category_l2", data_type=ScalarDataType.STRING),
+        FieldDefinition(name="relevance", data_type=ScalarDataType.INTEGER),
+        FieldDefinition(name="session_cart_value", data_type=ScalarDataType.DOUBLE),
+        FieldDefinition(name="hour_of_day", data_type=ScalarDataType.INTEGER),
+        FieldDefinition(name="day_of_week", data_type=ScalarDataType.INTEGER),
+    ]
+)
+
+product_id_feature = Feature(
+    source=request_source,
+    function=ColumnSelection("product_id"),
+    name="product_id",
+)
+
+category_l1_feature = Feature(
+    source=request_source,
+    function=ColumnSelection("category_l1"),
+    name="category_l1",
+)
+
+category_l2_feature = Feature(
+    source=request_source,
+    function=ColumnSelection("category_l2"),
+    name="category_l2",
+)
+
+relevance_feature = Feature(
+    source=request_source,
+    function=ColumnSelection("relevance"),
+    name="relevance",
+)
+
+session_cart_value_feature = Feature(
+    source=request_source,
+    function=ColumnSelection("session_cart_value"),
+    name="session_cart_value",
+)
+
+hour_of_day_feature = Feature(
+    source=request_source,
+    function=ColumnSelection("hour_of_day"),
+    name="hour_of_day",
+)
+
+day_of_week_feature = Feature(
+    source=request_source,
+    function=ColumnSelection("day_of_week"),
+    name="day_of_week",
+)
+
+request_features = [
+    product_id_feature,
+    category_l1_feature,
+    category_l2_feature,
+    relevance_feature,
+    session_cart_value_feature,
+    hour_of_day_feature,
+    day_of_week_feature,
+]
+
+fe = FeatureEngineeringClient()
+
+print("RequestSource features (passed in serving payload):")
+for f in request_features:
+    print(f"  {f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Register all features to Unity Catalog
+# MAGIC
+# MAGIC Registration is required before materialization
+
+# COMMAND ----------
+
+# DBTITLE 1,Register All Features to Unity Catalog
+
+all_registrable_features = (
+    product_batch_features
+    + product_rolling_features
+    + session_rolling_features
+    + request_features       
+)
+
+print(f"Registering {len(all_registrable_features)} features to {CATALOG}.{SCHEMA}...\n")
+
+def register_features(features):
+    """Register features to UC. If already registered, retrieve the existing object."""
+    registered = []
+    for f in features:
+        try:
+            r = fe.register_feature(feature=f, catalog_name=CATALOG, schema_name=SCHEMA)
+            print(f"  ✓ {f.name}")
+            registered.append(r)
+        except Exception as e:
+            if "already" in str(e).lower():
+                r = fe.get_feature(full_name=f"{CATALOG}.{SCHEMA}.{f.name}")
+                print(f"  • {f.name} (already registered)")
+                registered.append(r)
+            else:
+                print(f"  ✗ {f.name}: {e}")
+    return registered
+
+product_batch_features = register_features(product_batch_features)
+product_rolling_features = register_features(product_rolling_features)
+session_rolling_features = register_features(session_rolling_features)
+request_features = register_features(request_features)
+
+all_registered = (product_batch_features + product_rolling_features
+                  + session_rolling_features + request_features)
+print(f"\nDone. {len(all_registered)} features registered to {CATALOG}.{SCHEMA}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Materialization schedules from config
+# ---------------------------------------------------------------------------
+# Materialization schedules — driven by config.dev_mode
+#   dev_mode=true  → every 5 minutes (fast iteration, data appears quickly)
+#   dev_mode=false → production cadences (daily / hourly)
+# ---------------------------------------------------------------------------
+
+DEV_MODE = config.get("dev_mode", False)
+
+if DEV_MODE:
+    PRODUCT_ROLLING_TRIGGER = CronSchedule(quartz_cron_expression="0 */5 * * * ?", timezone_id="UTC")
+    SESSION_TRIGGER = CronSchedule(quartz_cron_expression="0 */5 * * * ?", timezone_id="UTC")
+    print("⚡ Dev mode: materialization triggers set to every 5 minutes")
+else:
+    PRODUCT_ROLLING_TRIGGER = CronSchedule(quartz_cron_expression="0 0 0 * * ?", timezone_id="UTC")  # daily
+    SESSION_TRIGGER = CronSchedule(quartz_cron_expression="0 0 * * * ?", timezone_id="UTC")           # hourly
+    print("Production mode: product rolling = daily, session = hourly")
+
+# COMMAND ----------
+
+# DBTITLE 1,Materialize Product Batch Features (Lakebase)
+# ---------------------------------------------------------------------------
+# Materialize product batch features (ColumnSelection) to Lakebase.
+#
+# ColumnSelection features use TableTrigger() — refreshed whenever the
+# source table (ecommerce_product) changes. Online only (no offline store).
+#
+# This creates the first Lakebase online table: product_batch_*
+# ---------------------------------------------------------------------------
+
+# Check if already materialized; skip if so
+_batch_mfs = fe.list_materialized_features(feature_name=f"{CATALOG}.{SCHEMA}.{product_batch_features[0].name}")
+if _batch_mfs:
+    print(f"Product batch features already materialized ({len(product_batch_features)} features) \u2014 skipping")
+else:
+    print("Materializing product batch features (6 ColumnSelection)...")
+    print(f"  Source: {CATALOG}.{SCHEMA}.{config['product_table']}")
+    print(f"  Trigger: TableTrigger (refresh on source change)")
+    print(f"  Online store: {ONLINE_STORE}\n")
+
+    fe.materialize_features(
+        features=product_batch_features,
+        online_config=OnlineStoreConfig(
+            catalog_name=CATALOG,
+            schema_name=SCHEMA,
+            table_name_prefix="product_batch",
+            online_store_name=ONLINE_STORE,
+        ),
+        trigger=TableTrigger(),
+    )
+    print("\u2713 Product batch features materialized to Lakebase")
+
+# COMMAND ----------
+
+# DBTITLE 1,Materialize Product Rolling Features (Lakebase)
+# ---------------------------------------------------------------------------
+# Materialize product rolling aggregate features to Lakebase.
+#
+# AggregationFunction + SlidingWindow features use CronSchedule.
+# AggregationFunction + CronSchedule requires both offline (Delta) and online
+# (Lakebase) stores. The offline table is an intermediate computation layer
+# that feeds Lakebase — do NOT use it as a training source (use
+# create_training_set() instead, which computes point-in-time aggregations
+# directly from the raw source with arbitrary train/eval splits).
+#
+# Daily refresh — product-level aggregates don't need sub-daily updates.
+# This creates the second Lakebase online table: product_rolling_*
+# ---------------------------------------------------------------------------
+
+_rolling_mfs = fe.list_materialized_features(feature_name=f"{CATALOG}.{SCHEMA}.{product_rolling_features[0].name}")
+if _rolling_mfs:
+    print(f"Product rolling features already materialized ({len(product_rolling_features)} features) \u2014 skipping")
+else:
+    schedule_desc = "every 5 min (dev)" if DEV_MODE else "daily at midnight UTC"
+    print(f"Materializing product rolling features (8 SlidingWindow aggregations)...")
+    print(f"  Sources: {config['ecommerce_table']} (counts) + {config['product_table']} (price bounds)")
+    print(f"  Trigger: CronSchedule ({schedule_desc})")
+    print(f"  Stores: offline (Delta, intermediate) + online (Lakebase)\n")
+
+    fe.materialize_features(
+        features=product_rolling_features,
+        offline_config=OfflineStoreConfig(
+            catalog_name=CATALOG,
+            schema_name=SCHEMA,
+            table_name_prefix="product_rolling_offline",
+        ),
+        online_config=OnlineStoreConfig(
+            catalog_name=CATALOG,
+            schema_name=SCHEMA,
+            table_name_prefix="product_rolling",
+            online_store_name=ONLINE_STORE,
+        ),
+        trigger=PRODUCT_ROLLING_TRIGGER,
+    )
+    print("\u2713 Product rolling features materialized to Lakebase")
+
+# COMMAND ----------
+
+# DBTITLE 1,Materialize Session Features (Lakebase)
+# ---------------------------------------------------------------------------
+# Materialize session-level aggregate features to Lakebase.
+#
+# INTERIM: SlidingWindow + DeltaTableSource + CronSchedule (hourly).
+# AggregationFunction + CronSchedule requires both offline (Delta) and online
+# (Lakebase) stores. The offline table is an intermediate computation layer
+# that feeds Lakebase — do NOT use it as a training source.
+#
+# PRODUCTION: Replace with StreamSource + StreamingMode() when Kafka is
+# available. The operators (Count, Avg, StddevPop, Sum) carry over unchanged.
+# ---------------------------------------------------------------------------
+
+_session_mfs = fe.list_materialized_features(feature_name=f"{CATALOG}.{SCHEMA}.{session_rolling_features[0].name}")
+if _session_mfs:
+    print(f"Session features already materialized ({len(session_rolling_features)} features) \u2014 skipping")
+else:
+    schedule_desc = "every 5 min (dev)" if DEV_MODE else "hourly"
+    print(f"Materializing session features (4 SlidingWindow aggregations)...")
+    print(f"  Source: {CATALOG}.{SCHEMA}.{config['ecommerce_table']}")
+    print(f"  Trigger: CronSchedule ({schedule_desc})")
+    print(f"  Stores: offline (Delta, intermediate) + online (Lakebase)")
+    print(f"  NOTE: Interim \u2014 convert to StreamSource + StreamingMode for production\n")
+
+    fe.materialize_features(
+        features=session_rolling_features,
+        offline_config=OfflineStoreConfig(
+            catalog_name=CATALOG,
+            schema_name=SCHEMA,
+            table_name_prefix="session_rolling_offline",
+        ),
+        online_config=OnlineStoreConfig(
+            catalog_name=CATALOG,
+            schema_name=SCHEMA,
+            table_name_prefix="session_rolling",
+            online_store_name=ONLINE_STORE,
+        ),
+        trigger=SESSION_TRIGGER,
+    )
+    print("\u2713 Session features materialized to Lakebase")
+
+# COMMAND ----------
+
+# DBTITLE 1,Session Features — Production Migration Notes
+# ---------------------------------------------------------------------------
+# Session features — production migration plan
+#
+# Current (interim): SlidingWindow(24h, 1h) + DeltaTableSource + CronSchedule
+#   - Materialized hourly to offline Delta + Lakebase (cell 25)
+#   - Operators: Count, Avg, StddevPop, Sum
+#
+# Production: RollingWindow(24h) + StreamSource + StreamingMode
+#   1. Create Kafka Stream: fe.create_stream(name=..., source_config=...,
+#      connection_config=..., schema_config=..., ingestion_config=...)
+#      - backfill_source: all data except last day of Nov
+#      - Backfill table must include stream_record_timestamp column
+#   2. Redefine features against StreamSource (same entity/operators)
+#   3. Delete current SlidingWindow materializations
+#   4. Materialize with StreamingMode() → Lakebase (online only, no offline)
+#
+# Operators (Count, Avg, StddevPop, Sum) are compatible with both
+# SlidingWindow and RollingWindow — no aggregation changes needed.
+# ---------------------------------------------------------------------------
+
+print("Session features — migration status")
+print("=" * 55)
+print(f"\nFeatures: {len(session_rolling_features)}")
+for f in session_rolling_features:
+    print(f"  {f.name}")
+print(f"\nCurrent (interim):")
+print(f"  Source:  DeltaTableSource (ecommerce_clickstream)")
+print(f"  Window:  SlidingWindow(24h, 1h slide)")
+print(f"  Trigger: CronSchedule (hourly)")
+print(f"  Stores:  offline (Delta) + online (Lakebase)")
+print(f"\nProduction target:")
+print(f"  Source:  StreamSource (Kafka clickstream topic)")
+print(f"  Window:  RollingWindow(24h)")
+print(f"  Trigger: StreamingMode (continuous)")
+print(f"  Stores:  online (Lakebase) only")
